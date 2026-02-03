@@ -2,8 +2,9 @@
 CAD.formats=
 CAD.pinconfig=
 CAD.provider=
-FREERTOS.IPParameters=Tasks01,configENABLE_FPU,configUSE_IDLE_HOOK,configUSE_TICK_HOOK
-FREERTOS.Tasks01=defaultTask,24,128,StartDefaultTask,Default,NULL,Dynamic,NULL,NULL
+FREERTOS.FootprintOK=true
+FREERTOS.IPParameters=Tasks01,configENABLE_FPU,configUSE_IDLE_HOOK,configUSE_TICK_HOOK,FootprintOK
+FREERTOS.Tasks01=ledTask,24,128,StartLedTask,Default,NULL,Static,ledTaskBuffer,ledTaskControlBlock;buttonTask,25,128,StartButtonTask,Default,NULL,Static,buttonTaskBuffer,buttonTaskControlBlock
 FREERTOS.configENABLE_FPU=1
 FREERTOS.configUSE_IDLE_HOOK=1
 FREERTOS.configUSE_TICK_HOOK=1

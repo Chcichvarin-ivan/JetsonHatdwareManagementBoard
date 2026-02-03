@@ -26,6 +26,7 @@
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
+typedef StaticTask_t osStaticThreadDef_t;
 /* USER CODE BEGIN PTD */
 
 /* USER CODE END PTD */
@@ -49,12 +50,29 @@ UART_HandleTypeDef huart2;
 
 WWDG_HandleTypeDef hwwdg;
 
-/* Definitions for defaultTask */
-osThreadId_t defaultTaskHandle;
-const osThreadAttr_t defaultTask_attributes = {
-  .name = "defaultTask",
-  .stack_size = 128 * 4,
+/* Definitions for ledTask */
+osThreadId_t ledTaskHandle;
+uint32_t ledTaskBuffer[ 128 ];
+osStaticThreadDef_t ledTaskControlBlock;
+const osThreadAttr_t ledTask_attributes = {
+  .name = "ledTask",
+  .cb_mem = &ledTaskControlBlock,
+  .cb_size = sizeof(ledTaskControlBlock),
+  .stack_mem = &ledTaskBuffer[0],
+  .stack_size = sizeof(ledTaskBuffer),
   .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for buttonTask */
+osThreadId_t buttonTaskHandle;
+uint32_t buttonTaskBuffer[ 128 ];
+osStaticThreadDef_t buttonTaskControlBlock;
+const osThreadAttr_t buttonTask_attributes = {
+  .name = "buttonTask",
+  .cb_mem = &buttonTaskControlBlock,
+  .cb_size = sizeof(buttonTaskControlBlock),
+  .stack_mem = &buttonTaskBuffer[0],
+  .stack_size = sizeof(buttonTaskBuffer),
+  .priority = (osPriority_t) osPriorityNormal1,
 };
 /* USER CODE BEGIN PV */
 
@@ -67,7 +85,8 @@ static void MX_I2C1_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_WWDG_Init(void);
 static void MX_RNG_Init(void);
-void StartDefaultTask(void *argument);
+void StartLedTask(void *argument);
+void StartButtonTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -135,8 +154,11 @@ int main(void)
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* creation of defaultTask */
-  defaultTaskHandle = osThreadNew(StartDefaultTask, NULL, &defaultTask_attributes);
+  /* creation of ledTask */
+  ledTaskHandle = osThreadNew(StartLedTask, NULL, &ledTask_attributes);
+
+  /* creation of buttonTask */
+  buttonTaskHandle = osThreadNew(StartButtonTask, NULL, &buttonTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
