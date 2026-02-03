@@ -410,25 +410,53 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+void HAL_WWDG_EarlyWakeupCallback(WWDG_HandleTypeDef *hwwdg)
+{
+  // This callback fires when the counter reaches the EWI threshold,
+  // which is inside the allowed refresh window.
 
+    // Refresh back to 0x7F (or whatever counter you configured)
+    HAL_WWDG_Refresh(hwwdg);
+}
 /* USER CODE END 4 */
 
-/* USER CODE BEGIN Header_StartDefaultTask */
+/* USER CODE BEGIN Header_StartLedTask */
 /**
-  * @brief  Function implementing the defaultTask thread.
+  * @brief  Function implementing the ledTask thread.
   * @param  argument: Not used
   * @retval None
   */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
+/* USER CODE END Header_StartLedTask */
+void StartLedTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+    osDelay(pdMS_TO_TICKS(1000));
+
+    HAL_GPIO_TogglePin( LD3_GPIO_Port, LD3_Pin);
+
   }
   /* USER CODE END 5 */
+}
+
+/* USER CODE BEGIN Header_StartButtonTask */
+/**
+* @brief Function implementing the buttonTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartButtonTask */
+void StartButtonTask(void *argument)
+{
+  /* USER CODE BEGIN StartButtonTask */
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartButtonTask */
 }
 
 /**
