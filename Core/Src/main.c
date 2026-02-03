@@ -131,7 +131,6 @@ int main(void)
   MX_WWDG_Init();
   MX_RNG_Init();
   /* USER CODE BEGIN 2 */
-
   /* USER CODE END 2 */
 
   /* Init scheduler */
