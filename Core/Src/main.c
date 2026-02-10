@@ -466,6 +466,15 @@ void HAL_WWDG_EarlyWakeupCallback(WWDG_HandleTypeDef *hwwdg)
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartLedTask */
+/* =========================
+   Jetson -> Nucleo command protocol (I2C master write)
+   ========================= */
+#define CMD_LED_SET     0x10  // payload: [0x10][0 or 1]
+
+typedef struct {
+  uint8_t cmd;
+  uint8_t value;
+} HostCommand;
 /**
   * @brief  Function implementing the ledTask thread.
   * @param  argument: Not used
