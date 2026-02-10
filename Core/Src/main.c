@@ -89,6 +89,17 @@ const osThreadAttr_t buttonTask_attributes = {
   .stack_size = sizeof(buttonTaskBuffer),
   .priority = (osPriority_t) osPriorityNormal1,
 };
+/* Definitions for g_hostCmdQueue */
+osMessageQueueId_t g_hostCmdQueueHandle;
+uint8_t g_hostCmdQueueBuffer[ 16 * sizeof( uint8_t ) ];
+osStaticMessageQDef_t g_hostCmdQueueControlBlock;
+const osMessageQueueAttr_t g_hostCmdQueue_attributes = {
+  .name = "g_hostCmdQueue",
+  .cb_mem = &g_hostCmdQueueControlBlock,
+  .cb_size = sizeof(g_hostCmdQueueControlBlock),
+  .mq_mem = &g_hostCmdQueueBuffer,
+  .mq_size = sizeof(g_hostCmdQueueBuffer)
+};
 /* USER CODE BEGIN PV */
 
 /* USER CODE END PV */
@@ -162,6 +173,10 @@ int main(void)
   /* USER CODE BEGIN RTOS_TIMERS */
   /* start timers, add new ones, ... */
   /* USER CODE END RTOS_TIMERS */
+
+  /* Create the queue(s) */
+  /* creation of g_hostCmdQueue */
+  g_hostCmdQueueHandle = osMessageQueueNew (16, sizeof(uint8_t), &g_hostCmdQueue_attributes);
 
   /* USER CODE BEGIN RTOS_QUEUES */
   /* add queues, ... */
