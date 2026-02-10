@@ -22,13 +22,28 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include "stdbool.h"
+#include "debug_console.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 typedef StaticTask_t osStaticThreadDef_t;
+typedef StaticQueue_t osStaticMessageQDef_t;
 /* USER CODE BEGIN PTD */
+#define I2C_SLAVE_ADDRESS_7BIT   (0x12)  // pick a free address, Jetson uses this
+#define I2C_TX_MAX_BYTES         (1 + 2*16)  // 1 count + up to 16 events (2 bytes each)
+#define EVENT_RING_SIZE          64
 
+#define BUTTON_COUNT             4
+
+/* Debounce integrator parameters */
+#define DEBOUNCE_MAX             8   // larger = more stable, slower response
+#define DEBOUNCE_MIN             0
+#define DEBOUNCE_THRESHOLD_ON    6   // must reach >= this to be considered pressed
+#define DEBOUNCE_THRESHOLD_OFF   2   // must fall <= this to be considered released
+
+/* Scan period */
+#define BUTTON_SCAN_PERIOD_MS    5
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
@@ -160,6 +175,21 @@ int main(void)
   buttonTaskHandle = osThreadNew(StartButtonTask, NULL, &buttonTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
+  dbg_config_t cfg = {
+    .huart = &huart2,
+    .hi2c  = &hi2c1,
+    .btn_port = GPIOC,
+    .btn_pin  = GPIO_PIN_13,
+    .baud_hint = 115200,
+    .login_token = "k1-7a",
+    .session_timeout_ms = 30000,
+    .auto_session_on_login = 0,
+    .default_echo = 1,
+    .default_timestamps = 0,
+    .default_prompt = 1,
+  };
+
+  DBG_Init(&cfg);
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
 
@@ -410,6 +440,17 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+
+void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
+{
+  DBG_OnUartRxCpltCallback(huart);
+}
+
+void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
+{
+  DBG_OnUartTxCpltCallback(huart);
+}
+
 void HAL_WWDG_EarlyWakeupCallback(WWDG_HandleTypeDef *hwwdg)
 {
   // This callback fires when the counter reaches the EWI threshold,
@@ -447,14 +488,143 @@ void StartLedTask(void *argument)
 * @param argument: Not used
 * @retval None
 */
+/* =========================
+   Button pin mapping
+   Update these to match your board wiring / CubeMX config.
+   NOTE: NUCLEO-L432KC has a user button B1 on PA0 on some Nucleo boards,
+         but L432KC Nucleo-32 variants vary. Use your actual pins.
+   ========================= */
+
+typedef struct {
+  GPIO_TypeDef *port;
+  uint16_t pin;
+  uint8_t id;
+  bool active_low;   // true if button pulls line low when pressed (common with pull-up)
+} ButtonHw;
+
+static const ButtonHw g_buttons[BUTTON_COUNT] = {
+  {GPIOA, GPIO_PIN_0, 0, true},
+  {GPIOA, GPIO_PIN_1, 1, true},
+  {GPIOA, GPIO_PIN_4, 2, true},
+  {GPIOB, GPIO_PIN_0, 3, true},
+};
+
+/* =========================
+   Event queue (ring buffer)
+   ========================= */
+
+typedef struct {
+    uint8_t button_id;
+    uint8_t event_type; // 1=pressed, 0=released
+} ButtonEvent;
+
+static ButtonEvent g_event_ring[EVENT_RING_SIZE];
+static volatile uint16_t g_evt_w = 0;
+static volatile uint16_t g_evt_r = 0;
+static volatile bool g_evt_overflow = false;
+
+/* A very small critical section for ISR/task safety. */
+static inline void evt_lock(void)   { taskENTER_CRITICAL(); }
+static inline void evt_unlock(void) { taskEXIT_CRITICAL();  }
+
+static bool evt_push(uint8_t button_id, uint8_t event_type)
+{
+    bool ok = true;
+    evt_lock();
+    uint16_t next_w = (uint16_t)((g_evt_w + 1) % EVENT_RING_SIZE);
+    if (next_w == g_evt_r) {
+        g_evt_overflow = true;
+        ok = false; // ring full
+    } else {
+        g_event_ring[g_evt_w].button_id = button_id;
+        g_event_ring[g_evt_w].event_type = event_type;
+        g_evt_w = next_w;
+    }
+    evt_unlock();
+    return ok;
+}
+
+static uint16_t evt_pop_many(ButtonEvent *out, uint16_t max_count)
+{
+    uint16_t count = 0;
+    evt_lock();
+    while ((g_evt_r != g_evt_w) && (count < max_count)) {
+        out[count++] = g_event_ring[g_evt_r];
+        g_evt_r = (uint16_t)((g_evt_r + 1) % EVENT_RING_SIZE);
+    }
+    evt_unlock();
+    return count;
+}
+
+/* =========================
+   Debounce state (integrator)
+   ========================= */
+
+typedef struct {
+    uint8_t integrator;   // 0..DEBOUNCE_MAX
+    bool debounced;       // stable state: true pressed, false released
+} DebounceState;
+
+static DebounceState g_db[BUTTON_COUNT];
+
+/* Read raw button (pressed=true/false) */
+static bool button_raw_pressed(const ButtonHw *b)
+{
+    GPIO_PinState s = HAL_GPIO_ReadPin(b->port, b->pin);
+    bool level_high = (s == GPIO_PIN_SET);
+    if (b->active_low) {
+        return !level_high;
+    } else {
+        return level_high;
+    }
+}
+
+static void debounce_update(uint32_t i)
+{
+    bool raw = button_raw_pressed(&g_buttons[i]);
+
+    /* Integrator update: count up when raw pressed, down when raw released */
+    if (raw) {
+        if (g_db[i].integrator < DEBOUNCE_MAX) g_db[i].integrator++;
+    } else {
+        if (g_db[i].integrator > DEBOUNCE_MIN) g_db[i].integrator--;
+    }
+
+    /* Hysteresis thresholds */
+    bool prev = g_db[i].debounced;
+    bool now = prev;
+
+    if (!prev && g_db[i].integrator >= DEBOUNCE_THRESHOLD_ON) {
+        now = true;
+    } else if (prev && g_db[i].integrator <= DEBOUNCE_THRESHOLD_OFF) {
+        now = false;
+    }
+
+    if (now != prev) {
+        g_db[i].debounced = now;
+        /* Generate event */
+        evt_push(g_buttons[i].id, now ? 1 : 0);
+    }
+}
+
 /* USER CODE END Header_StartButtonTask */
 void StartButtonTask(void *argument)
 {
   /* USER CODE BEGIN StartButtonTask */
+  (void)argument;
+  /* Initialize debounce states */
+  for (uint32_t i = 0; i < BUTTON_COUNT; i++) {
+    g_db[i].integrator = 0;
+    g_db[i].debounced = false;
+  }
+  TickType_t last = xTaskGetTickCount();
   /* Infinite loop */
   for(;;)
   {
-    osDelay(1);
+    for (uint32_t i = 0; i < BUTTON_COUNT; i++) {
+      debounce_update(i);
+    }
+    vTaskDelayUntil(&last, pdMS_TO_TICKS(BUTTON_SCAN_PERIOD_MS));
   }
   /* USER CODE END StartButtonTask */
 }
