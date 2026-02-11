@@ -38,7 +38,7 @@
  *   I2C script line storage for simple automation.
  */
 #define RX_SB_SIZE          256
-#define TX_MB_SIZE          2048
+#define TX_MB_SIZE          4096
 #define TX_CHUNK_SIZE       128
 
 #define CLI_LINE_MAX        160
@@ -62,6 +62,27 @@
 #define LOGIN_LOCKOUT_MS       15000
 #define LOGIN_BACKOFF_BASE_MS  300
 
+/* ---------------- Static task storage (TCB + stacks) ---------------- */
+/* Stack sizes are in WORDS (not bytes). */
+#define DBG_TX_STACK_WORDS   384
+#define DBG_CLI_STACK_WORDS  768
+#define DBG_I2C_STACK_WORDS  640
+#define DBG_SUP_STACK_WORDS  256
+#define DBG_KA_STACK_WORDS   256
+/* ===================== Smart RX (line gate) =====================
+ * ISR buffers incoming characters into a single line.
+ * Only when CR/LF arrives AND the line looks like a valid command,
+ * the entire line is forwarded to CLI via StreamBuffer.
+ *
+ * This reduces CPU usage and prevents CLI from waking on noise/garbage.
+ */
+#define DBG_RX_LINE_MAX   96  /* keep ISR line buffer small */
+
+static volatile uint8_t g_rx_line[DBG_RX_LINE_MAX];
+static volatile uint16_t g_rx_line_len = 0;
+
+/* enable/disable smart gating (set 1 for script-driven Linux use) */
+static volatile uint8_t g_smart_rx_enable = 1;
 /* ============================================================================
  * Module-global configuration copy
  * ============================================================================
@@ -84,9 +105,55 @@ static dbg_config_t g_cfg;
  * qI2cJobs:
  *   Holds I2C operations to run, executed by I2C worker task.
  */
+
+/* ============================================================================
+ * I2C worker task and queue
+ * ============================================================================
+ *
+ * All I2C transactions go through this single worker task.
+ * This avoids concurrent I2C access from multiple tasks and simplifies debugging.
+ */
 static StreamBufferHandle_t  sbUartRx;
 static MessageBufferHandle_t mbUartTx;
 static QueueHandle_t         qI2cJobs;
+
+typedef enum { I2C_OP_SCAN, I2C_OP_RD, I2C_OP_WR, I2C_OP_DELAY } i2c_op_t;
+
+typedef struct
+{
+  i2c_op_t op;                 /* operation type */
+  uint8_t  addr7;              /* 7-bit device address */
+  uint8_t  reg;                /* register address (8-bit mem addr) */
+  uint8_t  len;                /* length for read/write */
+  uint8_t  data[I2C_MAX_DATA]; /* write data buffer */
+  uint32_t delay_ms;           /* used if op == I2C_OP_DELAY */
+} i2c_job_t;
+
+/* Enqueue an I2C job to be executed by vI2cTask */
+static void enqueue_i2c_job(const i2c_job_t *job)
+{
+  if (!qI2cJobs) return;
+  if (xQueueSend(qI2cJobs, job, pdMS_TO_TICKS(50)) != pdPASS)
+    DBG_Puts("[i2c] queue full\r\n");
+}
+
+/* ---------------- Static queue storage ---------------- */
+static StaticQueue_t qI2cStatic;
+static uint8_t qI2cStorage[I2C_QUEUE_LEN * sizeof(i2c_job_t)];
+
+static StaticTask_t tcbTx, tcbCli, tcbI2c, tcbSup, tcbKeep;
+static StackType_t  stkTx[DBG_TX_STACK_WORDS];
+static StackType_t  stkCli[DBG_CLI_STACK_WORDS];
+static StackType_t  stkI2c[DBG_I2C_STACK_WORDS];
+static StackType_t  stkSup[DBG_SUP_STACK_WORDS];
+static StackType_t  stkKeep[DBG_KA_STACK_WORDS];
+
+/* ---------------- Static Stream/Message buffer storage ---------------- */
+static StaticStreamBuffer_t sbRxStruct;
+static uint8_t sbRxStorage[RX_SB_SIZE];
+
+static StaticStreamBuffer_t mbTxStruct;       /* MessageBuffer uses StaticStreamBuffer_t */
+static uint8_t mbTxStorage[TX_MB_SIZE];
 
 /* Task handles: allow ISR notifications, suspend/resume worker, etc. */
 static TaskHandle_t hTx, hCli, hI2c, hSup, hKeep;
@@ -1278,18 +1345,108 @@ void DBG_Init(const dbg_config_t *cfg)
   latency_enabled = 1;
   keepalive_enabled = 0;
 
-  sbUartRx = xStreamBufferCreate(RX_SB_SIZE, 1);
-  mbUartTx = xMessageBufferCreate(TX_MB_SIZE);
-  qI2cJobs = xQueueCreate(I2C_QUEUE_LEN, sizeof(i2c_job_t));
+  login_fails = 0;
+  lockout_until_tick = 0;
 
-  xTaskCreate(vUartTxTask,     "dbg_tx",  384, NULL, tskIDLE_PRIORITY+3, &hTx);
-  xTaskCreate(vCliTask,        "dbg_cli", 768, NULL, tskIDLE_PRIORITY+2, &hCli);
-  xTaskCreate(vI2cTask,        "dbg_i2c", 640, NULL, tskIDLE_PRIORITY+1, &hI2c);
-  xTaskCreate(vSupervisorTask, "dbg_sup", 256, NULL, tskIDLE_PRIORITY+1, &hSup);
-  xTaskCreate(vKeepaliveTask,  "dbg_ka",  256, NULL, tskIDLE_PRIORITY+1, &hKeep);
+  tx_drops = 0;
+  rx_overflows = 0;
 
-  /* Start with no session: disable I2C worker to save CPU */
+  script_len = 0;
+  script_recording = 0;
+
+  hist_count = 0;
+  hist_head = 0;
+  hist_nav = -1;
+
+  /* ---------------- Create static RX StreamBuffer ----------------
+   * Trigger level = 1 byte (CLI wakes on each byte).
+   */
+  sbUartRx = xStreamBufferCreateStatic(
+      RX_SB_SIZE,
+      1,
+      sbRxStorage,
+      &sbRxStruct
+  );
+
+  /* ---------------- Create static TX MessageBuffer ----------------
+   * MessageBuffer is a specialization of StreamBuffer.
+   * Trigger level = 1 byte (TX task wakes as soon as something exists).
+   */
+  mbUartTx = xMessageBufferCreateStatic(
+      TX_MB_SIZE,
+      mbTxStorage,
+      &mbTxStruct
+  );
+
+  /* ---------------- Create static I2C job queue ---------------- */
+  qI2cJobs = xQueueCreateStatic(
+      I2C_QUEUE_LEN,
+      sizeof(i2c_job_t),
+      qI2cStorage,
+      &qI2cStatic
+  );
+
+  /* Validate creation (optional but recommended) */
+  if (!sbUartRx || !mbUartTx || !qI2cJobs)
+  {
+    /* If any failed, do not proceed (should not fail if sizes are correct) */
+    return;
+  }
+
+  /* ---------------- Create tasks using xTaskCreateStatic ---------------- */
+  hTx = xTaskCreateStatic(
+      vUartTxTask,
+      "dbg_tx",
+      DBG_TX_STACK_WORDS,
+      NULL,
+      tskIDLE_PRIORITY + 3,
+      stkTx,
+      &tcbTx
+  );
+
+  hCli = xTaskCreateStatic(
+      vCliTask,
+      "dbg_cli",
+      DBG_CLI_STACK_WORDS,
+      NULL,
+      tskIDLE_PRIORITY + 2,
+      stkCli,
+      &tcbCli
+  );
+
+  hI2c = xTaskCreateStatic(
+      vI2cTask,
+      "dbg_i2c",
+      DBG_I2C_STACK_WORDS,
+      NULL,
+      tskIDLE_PRIORITY + 1,
+      stkI2c,
+      &tcbI2c
+  );
+
+  hSup = xTaskCreateStatic(
+      vSupervisorTask,
+      "dbg_sup",
+      DBG_SUP_STACK_WORDS,
+      NULL,
+      tskIDLE_PRIORITY + 1,
+      stkSup,
+      &tcbSup
+  );
+
+  hKeep = xTaskCreateStatic(
+      vKeepaliveTask,
+      "dbg_ka",
+      DBG_KA_STACK_WORDS,
+      NULL,
+      tskIDLE_PRIORITY + 1,
+      stkKeep,
+      &tcbKeep
+  );
+
+  /* Start with no session: suspend I2C worker to reduce load */
   if (hI2c) vTaskSuspend(hI2c);
 
+  /* Start UART RX interrupt */
   uart_rx_start();
 }
