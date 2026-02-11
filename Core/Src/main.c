@@ -90,6 +90,18 @@ const osThreadAttr_t buttonTask_attributes = {
   .stack_size = sizeof(buttonTaskBuffer),
   .priority = (osPriority_t) osPriorityNormal1,
 };
+/* Definitions for debugTask */
+osThreadId_t debugTaskHandle;
+uint32_t debugTaskBuffer[ 128 ];
+osStaticThreadDef_t debugTaskControlBlock;
+const osThreadAttr_t debugTask_attributes = {
+  .name = "debugTask",
+  .cb_mem = &debugTaskControlBlock,
+  .cb_size = sizeof(debugTaskControlBlock),
+  .stack_mem = &debugTaskBuffer[0],
+  .stack_size = sizeof(debugTaskBuffer),
+  .priority = (osPriority_t) osPriorityLow,
+};
 /* Definitions for g_hostCmdQueue */
 osMessageQueueId_t g_hostCmdQueueHandle;
 uint8_t g_hostCmdQueueBuffer[ 16 * sizeof( uint8_t ) ];
@@ -108,12 +120,14 @@ const osMessageQueueAttr_t g_hostCmdQueue_attributes = {
 /* Private function prototypes -----------------------------------------------*/
 void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
+static void MX_DMA_Init(void);
 static void MX_I2C1_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_WWDG_Init(void);
 static void MX_RNG_Init(void);
 void StartLedTask(void *argument);
 void StartButtonTask(void *argument);
+void StartDebugTask(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -153,6 +167,7 @@ int main(void)
 
   /* Initialize all configured peripherals */
   MX_GPIO_Init();
+  MX_DMA_Init();
   MX_I2C1_Init();
   MX_USART2_UART_Init();
   MX_WWDG_Init();
@@ -190,22 +205,10 @@ int main(void)
   /* creation of buttonTask */
   buttonTaskHandle = osThreadNew(StartButtonTask, NULL, &buttonTask_attributes);
 
-  /* USER CODE BEGIN RTOS_THREADS */
-  dbg_config_t cfg = {
-    .huart = &huart2,
-    .hi2c  = &hi2c1,
-    .btn_port = GPIOC,
-    .btn_pin  = GPIO_PIN_13,
-    .baud_hint = 115200,
-    .login_token = "k1-7a",
-    .session_timeout_ms = 30000,
-    .auto_session_on_login = 0,
-    .default_echo = 1,
-    .default_timestamps = 0,
-    .default_prompt = 1,
-  };
+  /* creation of debugTask */
+  debugTaskHandle = osThreadNew(StartDebugTask, NULL, &debugTask_attributes);
 
-  DBG_Init(&cfg);
+  /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
 
@@ -674,6 +677,39 @@ void StartButtonTask(void *argument)
     vTaskDelayUntil(&last, pdMS_TO_TICKS(BUTTON_SCAN_PERIOD_MS));
   }
   /* USER CODE END StartButtonTask */
+}
+
+/* USER CODE BEGIN Header_StartDebugTask */
+/**
+* @brief Function implementing the debugTask thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartDebugTask */
+void StartDebugTask(void *argument)
+{
+  /* USER CODE BEGIN StartDebugTask */
+  dbg_config_t cfg = {
+    .huart = &huart2,
+    .hi2c  = &hi2c1,
+    .btn_port = GPIOC,
+    .btn_pin  = GPIO_PIN_13,
+    .baud_hint = 115200,
+    .login_token = "k1-7a",
+    .session_timeout_ms = 30000,
+    .auto_session_on_login = 0,
+    .default_echo = 1,
+    .default_timestamps = 0,
+    .default_prompt = 1,
+  };
+
+  DBG_Init(&cfg);
+  /* Infinite loop */
+  for(;;)
+  {
+    osDelay(1);
+  }
+  /* USER CODE END StartDebugTask */
 }
 
 /**

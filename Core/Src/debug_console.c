@@ -1332,8 +1332,11 @@ static void vCliTask(void *arg)
 void DBG_Init(const dbg_config_t *cfg)
 {
   if (!cfg || !cfg->huart) return;
+
+  /* Copy config (pointers inside must remain valid) */
   g_cfg = *cfg;
 
+  /* Reset runtime state */
   logged_in = 0;
   session_active = 0;
   quiet_mode = 1;
