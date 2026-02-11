@@ -370,6 +370,60 @@ static void uart_rx_start(void)
   HAL_UART_Receive_IT(g_cfg.huart, &uart_rx_byte, 1);
 }
 
+/* Return 1 if c is acceptable as part of a command line */
+static inline int rx_is_cmd_char(uint8_t c)
+{
+  /* allow printable ASCII + space + tab */
+  if (c >= 0x20 && c <= 0x7E) return 1;
+  if (c == '\t') return 1;
+  return 0;
+}
+
+/* Fast “is this line plausibly a command?” check.
+ * Keep this VERY cheap (runs in ISR on newline only).
+ */
+static int rx_line_is_valid_cmd_prefix(const uint8_t *s, uint16_t n)
+{
+  /* trim leading spaces/tabs */
+  uint16_t i = 0;
+  while (i < n && (s[i] == ' ' || s[i] == '\t')) i++;
+  if (i == n) return 0;
+
+  /* Find token end */
+  uint16_t start = i;
+  while (i < n && s[i] != ' ' && s[i] != '\t') i++;
+  uint16_t toklen = (uint16_t)(i - start);
+  if (toklen == 0) return 0;
+
+  /* Compare first token against allowed commands.
+   * Keep this list short and match your CLI root commands.
+   */
+#define TOK_EQ(lit) (toklen == (sizeof(lit)-1) && memcmp((const void*)&s[start], (lit), sizeof(lit)-1) == 0)
+
+  if (TOK_EQ("help")) return 1;
+  if (TOK_EQ("login")) return 1;
+  if (TOK_EQ("logout")) return 1;
+  if (TOK_EQ("session")) return 1;
+  if (TOK_EQ("echo")) return 1;
+  if (TOK_EQ("prompt")) return 1;
+  if (TOK_EQ("time")) return 1;
+  if (TOK_EQ("loglvl")) return 1;
+  if (TOK_EQ("log")) return 1;
+  if (TOK_EQ("keepalive")) return 1;
+  if (TOK_EQ("lat")) return 1;
+  if (TOK_EQ("bin")) return 1;
+  if (TOK_EQ("clear")) return 1;
+  if (TOK_EQ("reset")) return 1;
+  if (TOK_EQ("btn")) return 1;
+  if (TOK_EQ("i2c")) return 1;
+  if (TOK_EQ("mem")) return 1;
+  if (TOK_EQ("txstat")) return 1;
+  if (TOK_EQ("rxstat")) return 1;
+  if (TOK_EQ("crash")) return 1;
+
+  return 0;
+}
+
 /* ============================================================================
  * HAL callback forwarding
  * ============================================================================
@@ -379,26 +433,99 @@ static void uart_rx_start(void)
  */
 void DBG_OnUartRxCpltCallback(UART_HandleTypeDef *huart)
 {
-  /* Ignore callbacks from other UART instances */
   if (!g_cfg.huart || huart != g_cfg.huart) return;
 
   BaseType_t hpw = pdFALSE;
 
-  /* Push byte into RX stream buffer; if full, count overflow */
-  if (sbUartRx)
+  /* Restart RX ASAP at the end (but safe to do here too) */
+  uint8_t b = uart_rx_byte;
+
+  /* If smart RX disabled, behave like classic byte-forwarding */
+  if (!g_smart_rx_enable)
   {
-    size_t ok = xStreamBufferSendFromISR(sbUartRx, &uart_rx_byte, 1, &hpw);
-    if (ok != 1) rx_overflows++;
+    if (sbUartRx)
+    {
+      size_t ok = xStreamBufferSendFromISR(sbUartRx, &b, 1, &hpw);
+      if (ok != 1) rx_overflows++;
+    }
+
+    /* any byte counts as activity */
+    last_rx_tick = xTaskGetTickCountFromISR();
+
+    HAL_UART_Receive_IT(g_cfg.huart, &uart_rx_byte, 1);
+    portYIELD_FROM_ISR(hpw);
+    return;
   }
 
-  /* Update activity for session timeout */
-  last_rx_tick = xTaskGetTickCountFromISR();
+  /* ==================== Smart Line Mode ==================== */
 
-  /* Re-arm RX */
+  /* Newline -> evaluate buffered line */
+  if (b == '\r' || b == '\n')
+  {
+    uint16_t n = g_rx_line_len;
+
+    /* If empty line: ignore (do NOT wake CLI) */
+    if (n == 0)
+    {
+      /* keep listening */
+      HAL_UART_Receive_IT(g_cfg.huart, &uart_rx_byte, 1);
+      return;
+    }
+
+    /* Validate prefix */
+    int valid = rx_line_is_valid_cmd_prefix((const uint8_t*)g_rx_line, n);
+
+    if (valid && sbUartRx)
+    {
+      /* Forward line to CLI in one shot + CRLF */
+      size_t ok1 = xStreamBufferSendFromISR(sbUartRx, (const void*)g_rx_line, n, &hpw);
+      size_t ok2 = xStreamBufferSendFromISR(sbUartRx, "\r\n", 2, &hpw);
+
+      if (ok1 != n || ok2 != 2) rx_overflows++;
+
+      /* Only count activity when we got a valid command line */
+      last_rx_tick = xTaskGetTickCountFromISR();
+    }
+    else
+    {
+      /* Invalid line => silently drop it */
+      /* (optional) you could increment a counter here if you want */
+    }
+
+    /* Reset for next line */
+    g_rx_line_len = 0;
+
+    HAL_UART_Receive_IT(g_cfg.huart, &uart_rx_byte, 1);
+    portYIELD_FROM_ISR(hpw);
+    return;
+  }
+
+  /* Regular character: keep it only if it looks like command content */
+  if (rx_is_cmd_char(b))
+  {
+    /* Append if space available; else drop line */
+    if (g_rx_line_len < (DBG_RX_LINE_MAX - 1))
+    {
+      g_rx_line[g_rx_line_len++] = b;
+    }
+    else
+    {
+      /* Line too long -> discard entire line (prevents partial commands) */
+      g_rx_line_len = 0;
+    }
+  }
+  else
+  {
+    /* Non-command character (including binary junk) => discard current line */
+    g_rx_line_len = 0;
+  }
+
+  /* Re-arm RX for next byte */
   HAL_UART_Receive_IT(g_cfg.huart, &uart_rx_byte, 1);
 
   portYIELD_FROM_ISR(hpw);
 }
+
 
 void DBG_OnUartTxCpltCallback(UART_HandleTypeDef *huart)
 {
