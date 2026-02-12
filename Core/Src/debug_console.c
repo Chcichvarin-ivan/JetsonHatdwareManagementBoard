@@ -40,7 +40,7 @@
  */
 #define RX_SB_SIZE          256
 #define TX_MB_SIZE          4096
-#define TX_CHUNK_SIZE       128
+#define TX_CHUNK_SIZE       1024
 
 #define CLI_LINE_MAX        160
 #define CLI_TOK_MAX         24
@@ -65,7 +65,7 @@
 
 /* ---------------- Static task storage (TCB + stacks) ---------------- */
 /* Stack sizes are in WORDS (not bytes). */
-#define DBG_TX_STACK_WORDS   384
+#define DBG_TX_STACK_WORDS   2048
 #define DBG_CLI_STACK_WORDS  768
 #define DBG_I2C_STACK_WORDS  640
 #define DBG_SUP_STACK_WORDS  256
