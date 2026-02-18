@@ -13,6 +13,7 @@
 #include <stdarg.h>
 
 #include "cmsis_os2.h"
+#include "btn_def.h"
 /* ============================================================================
  * Compile-time tunables
  * ============================================================================
@@ -93,6 +94,13 @@ static volatile uint8_t g_smart_rx_enable = 1;
  */
 static dbg_config_t g_cfg;
 
+/* ============================================================================
+ * Terminal/UI helpers
+ * ============================================================================
+ */
+static const char *PROMPT_LOCKED  = "locked> ";
+static const char *PROMPT_LOGGED  = "dbg> ";
+static const char *PROMPT_SESSION = "sess> ";
 /* ============================================================================
  * RTOS objects
  * ============================================================================
@@ -249,6 +257,7 @@ __attribute__((section(".noinit"))) static crash_dump_t g_crash;
  * Small time helpers
  * ============================================================================
  */
+static void check_btn_session(void);
 static uint32_t ticks_to_ms(uint32_t ticks) { return ticks * portTICK_PERIOD_MS; }
 static uint32_t ms_to_ticks(uint32_t ms) { return pdMS_TO_TICKS(ms); }
 
@@ -288,6 +297,20 @@ void DBG_Write(const void *data, size_t len)
   size_t sent = xMessageBufferSend(mbUartTx, data, len, 0);
   if (sent != len) tx_drops++;
 }
+/*
+ * DBG_Write_from_ISR:
+ *   - task context only
+ *   - enqueues bytes into mbUartTx
+ *   - returns immediately (0 tick wait)
+ *   - updates tx_drops if message buffer couldn't accept all bytes
+ */
+void DBG_Write_from_ISR(const void *data, size_t len)
+{
+  if (!mbUartTx || !data || len == 0) return;
+  size_t sent = xMessageBufferSendFromISR(mbUartTx, data, len, 0);
+  if (sent != len) tx_drops++;
+}
+
 
 /* DBG_Puts: convenience wrapper for null-terminated strings */
 void DBG_Puts(const char *s)
@@ -295,7 +318,11 @@ void DBG_Puts(const char *s)
   if (!s) return;
   DBG_Write(s, strlen(s));
 }
-
+void DBG_Puts_from_ISR(const char *s)
+{
+  if (!s) return;
+  DBG_Write_from_ISR(s, strlen(s));
+}
 /* DBG_Printf: formats into a stack buffer, then enqueues */
 void DBG_Printf(const char *fmt, ...)
 {
@@ -310,7 +337,19 @@ void DBG_Printf(const char *fmt, ...)
 
   DBG_Write(buf, (size_t)n);
 }
+void DBG_Printf_from_ISR(const char *fmt, ...)
+{
+  char buf[256];
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+  va_end(ap);
 
+  if (n <= 0) return;
+  if ((size_t)n > sizeof(buf)) n = (int)sizeof(buf);
+
+  DBG_Write_from_ISR(buf, (size_t)n);
+}
 /* ============================================================================
  * Logging API
  * ============================================================================
@@ -458,7 +497,10 @@ void DBG_OnUartRxCpltCallback(UART_HandleTypeDef *huart)
   }
 
   /* ==================== Smart Line Mode ==================== */
-
+  if (b == 0x03)
+  {
+    check_btn_session();
+  }
   /* Newline -> evaluate buffered line */
   if (b == '\r' || b == '\n')
   {
@@ -503,6 +545,9 @@ void DBG_OnUartRxCpltCallback(UART_HandleTypeDef *huart)
   /* Regular character: keep it only if it looks like command content */
   if (rx_is_cmd_char(b))
   {
+    if (echo_enabled) {
+      DBG_Write_from_ISR(&b,1);
+    }
     /* Append if space available; else drop line */
     if (g_rx_line_len < (DBG_RX_LINE_MAX - 1))
     {
@@ -567,7 +612,126 @@ static void vUartTxTask(void *arg)
     ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
   }
 }
+/*
+vBtnSessionTask
+*/
+static volatile uint8_t g_btn_session_active = 0;
+static TaskHandle_t hBtnSess = NULL;
 
+/* If using xTaskCreateStatic */
+#define DBG_BTNSESS_STACK_WORDS 384
+static StaticTask_t tcbBtnSess;
+static StackType_t  stkBtnSess[DBG_BTNSESS_STACK_WORDS];
+static const char *btn_evt_name(btn_evt_type_t t)
+{
+  switch (t)
+  {
+    case BTN_EVT_PRESSED:      return "PRESS";
+    case BTN_EVT_LONG_PRESS:   return "LONG";
+    case BTN_EVT_DOUBLE_PRESS: return "DOUBLE";
+    default:                   return "UNK";
+  }
+}
+
+/* Stop session from anywhere (CLI Ctrl-C or commands) */
+static void btn_session_stop(const char *reason)
+{
+  portBASE_TYPE xTaskWoken;
+  if (!g_btn_session_active) return;
+
+  g_btn_session_active = 0;
+
+  /* wake the session task if it is blocked */
+  if (hBtnSess) vTaskNotifyGiveFromISR(hBtnSess, &xTaskWoken);
+
+  if (reason)
+    DBG_Printf_from_ISR("\r\n[btn] session stopped: %s\r\n", reason);
+
+  /* restore prompt */
+  if (prompt_enabled) DBG_Puts_from_ISR(logged_in ? (session_active?PROMPT_SESSION:PROMPT_LOGGED) : PROMPT_LOCKED);
+  if( xTaskWoken == pdTRUE) {
+    taskYIELD();
+  }
+}
+
+static void vBtnSessionTask(void *arg)
+{
+  (void)arg;
+
+  QueueHandle_t q = NULL;
+  btn_event_msg_t ev;
+
+  for (;;)
+  {
+    /* Sleep until session is started */
+    ulTaskNotifyTake(pdTRUE, portMAX_DELAY);
+
+    /* Session start banner */
+    DBG_Puts("\r\n[btn] session started. Press Ctrl-C to stop.\r\n");
+
+    /* Get queue handle (may be created later) */
+    q = BTN_GetEventQueue();
+    if (!q)
+    {
+      DBG_Puts("[btn] ERROR: button event queue not ready\r\n");
+      g_btn_session_active = 0;
+      if (prompt_enabled) DBG_Puts(logged_in ? (session_active?PROMPT_SESSION:PROMPT_LOGGED) : PROMPT_LOCKED);
+      continue;
+    }
+
+    while (g_btn_session_active)
+    {
+      /* Wait for button events but allow immediate stop via notify */
+      /* We use a timed wait so Ctrl-C notify can break quickly. */
+      if (xQueueReceive(q, &ev, pdMS_TO_TICKS(200)) == pdPASS)
+      {
+        /* Stream output */
+        DBG_Printf("[btn pin=0x%04X] %s @%lu ms\r\n",
+                   ev.pin, btn_evt_name(ev.type), (unsigned long)ev.t_ms);
+      }
+
+      /* If Ctrl-C happened, CLI calls btn_session_stop() and notifies us.
+         This makes us wake immediately. */
+      if (ulTaskNotifyTake(pdTRUE, 0) > 0)
+      {
+        /* stop requested */
+        break;
+      }
+    }
+
+    /* Session end banner */
+    DBG_Puts_from_ISR("[btn] session ended\r\n");
+    if (prompt_enabled) DBG_Puts_from_ISR(logged_in ? (session_active?PROMPT_SESSION:PROMPT_LOGGED) : PROMPT_LOCKED);
+  }
+}
+static void check_btn_session(void) {
+  if (g_btn_session_active)
+  {
+    btn_session_stop("Ctrl-C");
+    /* do not treat Ctrl-C as part of input line */
+    return;
+  }
+  /* otherwise you may ignore it or print ^C */
+  DBG_Puts_from_ISR("^C\r\n");
+  if (prompt_enabled) DBG_Puts_from_ISR(logged_in ? (session_active?PROMPT_SESSION:PROMPT_LOGGED) : PROMPT_LOCKED);
+}
+
+/* Start button streaming session */
+static void cmd_btn_session_start(void)
+{
+  if (g_btn_session_active)
+  {
+    DBG_Puts("[btn] session already running\r\n");
+    return;
+  }
+
+  g_btn_session_active = 1;
+
+  /* Optional: silence prompt during streaming */
+  /* prompt_enabled = 0;  */  /* if you want absolutely clean output */
+
+  if (hBtnSess) xTaskNotifyGive(hBtnSess);
+}
 
 /*
  * vI2cTask:
@@ -775,13 +939,7 @@ static const char* history_get(int offset)
   return history[idx];
 }
 
-/* ============================================================================
- * Terminal/UI helpers
- * ============================================================================
- */
-static const char *PROMPT_LOCKED  = "locked> ";
-static const char *PROMPT_LOGGED  = "dbg> ";
-static const char *PROMPT_SESSION = "sess> ";
+
 
 /* Clear terminal screen using ANSI escape sequence */
 static void term_clear(void) { DBG_Puts("\033[2J\033[H"); }
@@ -1007,7 +1165,7 @@ static void trim_crlf(char *s)
  */
 
 /* Print prompt based on current state (single place) */
-static void cli_print_prompt(void)
+ void cli_print_prompt(void)
 {
   if (!prompt_enabled) return;
 
@@ -1163,7 +1321,20 @@ static void handle_line(char *line)
     cli_print_prompt();
     return;
   }
+  if (!strcmp(tok[0], "echo"))
+  {
+    if (!logged_in) { DBG_Puts("[debug] login required\r\n"); return; }
+    if (n >= 2 && !strcmp(tok[1], "on"))  { echo_enabled = 1; DBG_Puts("[debug] echo on\r\n"); }
+    else if (n >= 2 && !strcmp(tok[1], "off")) { echo_enabled = 0; DBG_Puts("[debug] echo off\r\n"); }
+    else DBG_Puts("usage: echo on|off\r\n");
+    return;
+  }
 
+  if (!strcmp(tok[0], "whoami"))
+  {
+     DBG_Printf("logged_in=%d session_active=%d\r\n", logged_in, session_active);
+    return;
+  }
   /* Other toggles like echo/time/prompt/keepalive/bin/lat/mem ... */
   /* ... implement similarly with early returns ... */
 
@@ -1179,8 +1350,12 @@ static void handle_line(char *line)
   /* Button */
   if (strcmp(tok[0], "btn") == 0)
   {
-    GPIO_PinState st = HAL_GPIO_ReadPin(g_cfg.btn_port, g_cfg.btn_pin);
-    DBG_Puts(st == GPIO_PIN_RESET ? "BTN: pressed\r\n" : "BTN: released\r\n");
+    if (n >= 2 && strcmp(tok[1], "session") == 0)
+    {
+      cmd_btn_session_start();
+      /* do NOT print prompt right away; session prints its own banner */
+      return;
+    }
     cli_print_latency(t0);
     cli_print_prompt();
     return;
@@ -1245,6 +1420,7 @@ static void vCliTask(void *arg)
     uint8_t ch;
     if (xStreamBufferReceive(sbUartRx, &ch, 1, portMAX_DELAY) != 1) continue;
 
+
     /* If binary mode enabled, ignore CLI input bytes */
     if (binary_mode) continue;
 
@@ -1294,8 +1470,9 @@ static void vCliTask(void *arg)
     }
 
     /* Echo typed char (if enabled); TAB is treated separately elsewhere */
-    if (echo_enabled && ch != '\t') DBG_Write(&ch, 1);
-
+    if (echo_enabled && ch != '\t') {
+      DBG_Write(&ch, 1);
+    }
     /* Enter -> execute */
     if (ch == '\r' || ch == '\n')
     {
@@ -1364,7 +1541,7 @@ void DBG_Init(const dbg_config_t *cfg)
   logged_in = 0;
   session_active = 0;
   quiet_mode = 1;
-  echo_enabled = 0;
+  echo_enabled = 1;
   prompt_enabled = cfg->default_prompt ? 1 : 0;
   timestamps_enabled = cfg->default_timestamps ? 1 : 0;
   log_level = 2;
@@ -1470,6 +1647,17 @@ void DBG_Init(const dbg_config_t *cfg)
       stkKeep,
       &tcbKeep
   );
+  hBtnSess = xTaskCreateStatic(
+      vBtnSessionTask,
+      "dbg_btn",
+      DBG_BTNSESS_STACK_WORDS,
+      NULL,
+      tskIDLE_PRIORITY + 1,
+      stkBtnSess,
+      &tcbBtnSess
+  );
+
+  /* It blocks on ulTaskNotifyTake forever by design, so no suspend needed */
 
   /* Start with no session: suspend I2C worker to reduce load */
   if (hI2c) vTaskSuspend(hI2c);

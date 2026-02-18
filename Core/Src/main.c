@@ -776,7 +776,7 @@ void StartDebugTask(void *argument)
     .btn_pin  = GPIO_PIN_13,
     .baud_hint = 115200,
     .login_token = "k1-7a",
-    .session_timeout_ms = 30000,
+    .session_timeout_ms = 300000,
     .auto_session_on_login = 0,
     .default_echo = 1,
     .default_timestamps = 0,
