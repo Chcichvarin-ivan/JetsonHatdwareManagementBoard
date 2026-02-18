@@ -24,6 +24,9 @@
 /* USER CODE BEGIN Includes */
 #include "stdbool.h"
 #include "debug_console.h"
+#include "FreeRTOS.h"
+#include "queue.h"
+#include "btn_def.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,10 +40,7 @@ typedef StaticQueue_t osStaticMessageQDef_t;
 #define BUTTON_COUNT             4
 
 /* Debounce integrator parameters */
-#define DEBOUNCE_MAX             8   // larger = more stable, slower response
-#define DEBOUNCE_MIN             0
-#define DEBOUNCE_THRESHOLD_ON    6   // must reach >= this to be considered pressed
-#define DEBOUNCE_THRESHOLD_OFF   2   // must fall <= this to be considered released
+#define DEBOUNCE_MAX             4   // larger = more stable, slower response
 
 /* Scan period */
 #define BUTTON_SCAN_PERIOD_MS    5
@@ -535,148 +535,226 @@ void StartLedTask(void *argument)
 }
 
 /* USER CODE BEGIN Header_StartButtonTask */
-/**
-* @brief Function implementing the buttonTask thread.
-* @param argument: Not used
-* @retval None
-*/
+
+
+#define BTN_EVENT_Q_LEN  16
+
+static StaticQueue_t g_btnQStruct;
+static uint8_t g_btnQStorage[BTN_EVENT_Q_LEN * sizeof(btn_event_msg_t)];
+static QueueHandle_t g_btnQ = NULL;
+
+/* Create queue once at init (task context) */
+static void BTN_EventQueueInit(void)
+{
+  if (g_btnQ) return;
+  g_btnQ = xQueueCreateStatic(
+      BTN_EVENT_Q_LEN,
+      sizeof(btn_event_msg_t),
+      g_btnQStorage,
+      &g_btnQStruct
+  );
+}
+
+/* Get handle so other tasks can receive events */
+QueueHandle_t BTN_GetEventQueue(void)
+{
+  return g_btnQ;
+}
+
+/* Post event (task context). Non-blocking. */
+static void BTN_PostEvent(btn_evt_type_t type, uint16_t pin, uint32_t now_ms)
+{
+  if (!g_btnQ) return;
+
+  btn_event_msg_t e = {.type = type, .pin = pin, .t_ms = now_ms};
+  (void)xQueueSend(g_btnQ, &e, 0); /* 0 tick wait: drop if full */
+}
+/* =========================
+   Debounce state (integrator)
+   ========================= */
+
+typedef struct
+{
+  GPIO_TypeDef *port;
+  uint16_t      pin;
+  uint8_t       active_low;
+  /* ---- Debounce integrator ----
+   * stable: debounced level (0=not pressed, 1=pressed)
+   * integ:  integrator 0..db_max
+   */
+  uint8_t stable;     /* 0=not pressed, 1=pressed (debounced) */
+  uint8_t integ;      /* 0..db_max */
+  uint8_t db_max;     /* threshold: e.g. 4 for ~20ms at 5ms sampling */
+
+  /* ---- Gesture timing ---- */
+  uint32_t long_press_ms;      /* e.g. 800 */
+  uint32_t double_window_ms;   /* e.g. 300 */
+  uint32_t pressed_at_ms;      /* when stable became pressed */
+  uint8_t  long_fired;
+
+  /* ---- Double press tracking ---- */
+  uint8_t  waiting_second;
+  uint32_t first_release_ms;
+} btn_t;
+
 /* =========================
    Button pin mapping
    Update these to match your board wiring / CubeMX config.
    NOTE: NUCLEO-L432KC has a user button B1 on PA0 on some Nucleo boards,
          but L432KC Nucleo-32 variants vary. Use your actual pins.
    ========================= */
-
-typedef struct {
-  GPIO_TypeDef *port;
-  uint16_t pin;
-  uint8_t id;
-  bool active_low;   // true if button pulls line low when pressed (common with pull-up)
-} ButtonHw;
-
-static const ButtonHw g_buttons[BUTTON_COUNT] = {
-  {GPIOA, GPIO_PIN_0, 0, true},
-  {GPIOA, GPIO_PIN_1, 1, true},
-  {GPIOA, GPIO_PIN_4, 2, true},
-  {GPIOB, GPIO_PIN_0, 3, true},
+static btn_t g_db[BUTTON_COUNT] = {
+  {GPIOA, GPIO_PIN_1,1,
+      0, 0, DEBOUNCE_MAX, /* 5ms tick -> ~20ms debounce */
+    1500,
+    300,
+    0,
+    0,
+    0,
+    0,
+  },
+  {GPIOA, GPIO_PIN_3, 1,
+    0, 0, DEBOUNCE_MAX, /* 5ms tick -> ~20ms debounce */
+  1500,
+  300,
+  0,
+  0,
+  0,
+  0,
+  },
+  {GPIOA, GPIO_PIN_4, 1,
+    0, 0, 4, /* 5ms tick -> ~20ms debounce */
+ 1500,
+ 300,
+ 0,
+ 0,
+ 0,
+ 0,
+ },
+  {GPIOA, GPIO_PIN_5, 1,
+    0, 0, 4, /* 5ms tick -> ~20ms debounce */
+ 1500,
+ 300,
+ 0,
+ 0,
+ 0,
+ 0,
+ },
 };
 
-/* =========================
-   Event queue (ring buffer)
-   ========================= */
-
-typedef struct {
-    uint8_t button_id;
-    uint8_t event_type; // 1=pressed, 0=released
-} ButtonEvent;
-
-static ButtonEvent g_event_ring[EVENT_RING_SIZE];
-static volatile uint16_t g_evt_w = 0;
-static volatile uint16_t g_evt_r = 0;
-static volatile bool g_evt_overflow = false;
-
-/* A very small critical section for ISR/task safety. */
-static inline void evt_lock(void)   { taskENTER_CRITICAL(); }
-static inline void evt_unlock(void) { taskEXIT_CRITICAL();  }
-
-static bool evt_push(uint8_t button_id, uint8_t event_type)
-{
-    bool ok = true;
-    evt_lock();
-    uint16_t next_w = (uint16_t)((g_evt_w + 1) % EVENT_RING_SIZE);
-    if (next_w == g_evt_r) {
-        g_evt_overflow = true;
-        ok = false; // ring full
-    } else {
-        g_event_ring[g_evt_w].button_id = button_id;
-        g_event_ring[g_evt_w].event_type = event_type;
-        g_evt_w = next_w;
-    }
-    evt_unlock();
-    return ok;
-}
-
-static uint16_t evt_pop_many(ButtonEvent *out, uint16_t max_count)
-{
-    uint16_t count = 0;
-    evt_lock();
-    while ((g_evt_r != g_evt_w) && (count < max_count)) {
-        out[count++] = g_event_ring[g_evt_r];
-        g_evt_r = (uint16_t)((g_evt_r + 1) % EVENT_RING_SIZE);
-    }
-    evt_unlock();
-    return count;
-}
-
-/* =========================
-   Debounce state (integrator)
-   ========================= */
-
-typedef struct {
-    uint8_t integrator;   // 0..DEBOUNCE_MAX
-    bool debounced;       // stable state: true pressed, false released
-} DebounceState;
-
-static DebounceState g_db[BUTTON_COUNT];
 
 /* Read raw button (pressed=true/false) */
-static bool button_raw_pressed(const ButtonHw *b)
+static inline uint8_t btn_read_raw_pressed(GPIO_TypeDef *port, uint16_t pin, uint8_t active_low)
 {
-    GPIO_PinState s = HAL_GPIO_ReadPin(b->port, b->pin);
-    bool level_high = (s == GPIO_PIN_SET);
-    if (b->active_low) {
-        return !level_high;
-    } else {
-        return level_high;
-    }
+  uint8_t level = (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_SET) ? 1u : 0u;
+  return active_low ? (uint8_t)(!level) : level; /* pressed=1 */
 }
 
-static void debounce_update(uint32_t i)
+static uint8_t btn_debounce_update(btn_t *b, uint8_t raw_pressed)
 {
-    bool raw = button_raw_pressed(&g_buttons[i]);
+  if (raw_pressed)
+  {
+    if (b->integ < b->db_max) b->integ++;
+  }
+  else
+  {
+    if (b->integ > 0) b->integ--;
+  }
 
-    /* Integrator update: count up when raw pressed, down when raw released */
-    if (raw) {
-        if (g_db[i].integrator < DEBOUNCE_MAX) g_db[i].integrator++;
-    } else {
-        if (g_db[i].integrator > DEBOUNCE_MIN) g_db[i].integrator--;
-    }
-
-    /* Hysteresis thresholds */
-    bool prev = g_db[i].debounced;
-    bool now = prev;
-
-    if (!prev && g_db[i].integrator >= DEBOUNCE_THRESHOLD_ON) {
-        now = true;
-    } else if (prev && g_db[i].integrator <= DEBOUNCE_THRESHOLD_OFF) {
-        now = false;
-    }
-
-    if (now != prev) {
-        g_db[i].debounced = now;
-        /* Generate event */
-        evt_push(g_buttons[i].id, now ? 1 : 0);
-    }
+  if (b->integ == b->db_max && b->stable == 0) { b->stable = 1; return 1; }
+  if (b->integ == 0 && b->stable == 1)         { b->stable = 0; return 1; }
+  return 0;
 }
 
+void BTN_UpdateAndPost(btn_t *b, uint32_t now_ms)
+{
+  uint8_t raw = btn_read_raw_pressed(b->port, b->pin, b->active_low);
+  uint8_t changed = btn_debounce_update(b, raw);
+
+  /* Debounced press edge */
+  if (changed && b->stable == 1)
+  {
+    b->pressed_at_ms = now_ms;
+    b->long_fired = 0;
+    /* do not post anything yet (short press is decided later) */
+  }
+
+  /* Long press detection while held */
+  if (b->stable == 1 && !b->long_fired)
+  {
+    if ((now_ms - b->pressed_at_ms) >= b->long_press_ms)
+    {
+      b->long_fired = 1;
+      b->waiting_second = 0; /* long cancels double */
+      BTN_PostEvent(BTN_EVT_LONG_PRESS, b->pin, now_ms);
+    }
+  }
+
+  /* Debounced release edge */
+  if (changed && b->stable == 0)
+  {
+    if (b->long_fired)
+    {
+      /* already reported LONG; release produces no event */
+      return;
+    }
+
+    if (b->waiting_second)
+    {
+      /* second click release within window => DOUBLE */
+      if ((now_ms - b->first_release_ms) <= b->double_window_ms)
+      {
+        b->waiting_second = 0;
+        BTN_PostEvent(BTN_EVT_DOUBLE_PRESS, b->pin, now_ms);
+      }
+      else
+      {
+        /* too late: treat as "new first" */
+        b->first_release_ms = now_ms;
+        b->waiting_second = 1;
+      }
+    }
+    else
+    {
+      /* first short click released: start window */
+      b->waiting_second = 1;
+      b->first_release_ms = now_ms;
+    }
+  }
+
+  /* Finalize single short press when window expires (no second press) */
+  if (b->waiting_second && b->stable == 0)
+  {
+    if ((now_ms - b->first_release_ms) > b->double_window_ms)
+    {
+      b->waiting_second = 0;
+      BTN_PostEvent(BTN_EVT_PRESSED, b->pin, now_ms);
+    }
+  }
+}
+/**
+* @brief Function implementing the buttonTask thread.
+* @param argument: Not used
+* @retval None
+*/
 /* USER CODE END Header_StartButtonTask */
 void StartButtonTask(void *argument)
 {
   /* USER CODE BEGIN StartButtonTask */
   (void)argument;
+
+  BTN_EventQueueInit(); /* create queue once */
   /* Initialize debounce states */
-  for (uint32_t i = 0; i < BUTTON_COUNT; i++) {
-    g_db[i].integrator = 0;
-    g_db[i].debounced = false;
-  }
-  TickType_t last = xTaskGetTickCount();
   /* Infinite loop */
+  uint32_t now_ms = 0;
   for(;;)
   {
+
     for (uint32_t i = 0; i < BUTTON_COUNT; i++) {
-      debounce_update(i);
+      now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
+      BTN_UpdateAndPost(&g_db[i], now_ms);
     }
-    vTaskDelayUntil(&last, pdMS_TO_TICKS(BUTTON_SCAN_PERIOD_MS));
+    osDelay(pdMS_TO_TICKS(BUTTON_SCAN_PERIOD_MS));
   }
   /* USER CODE END StartButtonTask */
 }
