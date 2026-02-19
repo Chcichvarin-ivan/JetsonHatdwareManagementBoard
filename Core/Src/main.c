@@ -27,6 +27,7 @@
 #include "FreeRTOS.h"
 #include "queue.h"
 #include "btn_def.h"
+#include "i2c_app.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -37,7 +38,7 @@ typedef StaticQueue_t osStaticMessageQDef_t;
 #define I2C_TX_MAX_BYTES         (1 + 2*16)  // 1 count + up to 16 events (2 bytes each)
 #define EVENT_RING_SIZE          64
 
-#define BUTTON_COUNT             4
+#define BUTTON_COUNT             1
 
 /* Debounce integrator parameters */
 #define DEBOUNCE_MAX             4   // larger = more stable, slower response
@@ -88,7 +89,7 @@ const osThreadAttr_t buttonTask_attributes = {
   .cb_size = sizeof(buttonTaskControlBlock),
   .stack_mem = &buttonTaskBuffer[0],
   .stack_size = sizeof(buttonTaskBuffer),
-  .priority = (osPriority_t) osPriorityNormal1,
+  .priority = (osPriority_t) osPriorityHigh,
 };
 /* Definitions for debugTask */
 osThreadId_t debugTaskHandle;
@@ -210,11 +211,11 @@ int main(void)
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
-  HAL_GPIO_WritePin(GPIOB, LED_Pin, GPIO_PIN_SET);
-  /* USER CODE END RTOS_THREADS */
+
 
   /* USER CODE BEGIN RTOS_EVENTS */
   /* add events, ... */
+  I2C_SlaveApp_Init(&hi2c1);
   /* USER CODE END RTOS_EVENTS */
 
   /* Start scheduler */
@@ -300,7 +301,7 @@ static void MX_I2C1_Init(void)
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.Timing = 0x00B10E24;
-  hi2c1.Init.OwnAddress1 = 0;
+  hi2c1.Init.OwnAddress1 = 128;
   hi2c1.Init.AddressingMode = I2C_ADDRESSINGMODE_7BIT;
   hi2c1.Init.DualAddressMode = I2C_DUALADDRESS_DISABLE;
   hi2c1.Init.OwnAddress2 = 0;
@@ -508,7 +509,7 @@ void HAL_WWDG_EarlyWakeupCallback(WWDG_HandleTypeDef *hwwdg)
 /* =========================
    Jetson -> Nucleo command protocol (I2C master write)
    ========================= */
-#define CMD_LED_SET     0x10  // payload: [0x10][0 or 1]
+
 
 typedef struct {
   uint8_t cmd;
@@ -519,6 +520,10 @@ typedef struct {
   * @param  argument: Not used
   * @retval None
   */
+static uint8_t LedState;
+void setLedState(uint8_t in_state) {
+  LedState = in_state;
+}
 /* USER CODE END Header_StartLedTask */
 void StartLedTask(void *argument)
 {
@@ -526,9 +531,19 @@ void StartLedTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
-    osDelay(pdMS_TO_TICKS(1000));
+    osDelay(pdMS_TO_TICKS(500));
 
     HAL_GPIO_TogglePin( LD3_GPIO_Port, LD3_Pin);
+    if (LedState ==  I2C_SLAVE_LED_ON) {
+      HAL_GPIO_WritePin(GPIOB, LED_Pin, GPIO_PIN_SET);
+      /* USER CODE END RTOS_THREADS */
+    }else if (LedState ==   I2C_SLAVE_LED_FLASH2H) {
+      HAL_GPIO_TogglePin(GPIOB, LED_Pin);
+    }else if (LedState == I2C_SLAVE_LED_OFF){
+      HAL_GPIO_WritePin(GPIOB, LED_Pin, GPIO_PIN_RESET);
+    }else if (LedState == I2C_SLAVE_LED_SHTDWN) {
+      HAL_GPIO_WritePin(GPIOB, LED_Pin, GPIO_PIN_RESET);
+    }
 
   }
   /* USER CODE END 5 */
@@ -606,40 +621,13 @@ typedef struct
 static btn_t g_db[BUTTON_COUNT] = {
   {GPIOA, GPIO_PIN_1,1,
       0, 0, DEBOUNCE_MAX, /* 5ms tick -> ~20ms debounce */
-    1500,
+    1200,
     300,
     0,
     0,
     0,
     0,
-  },
-  {GPIOA, GPIO_PIN_3, 1,
-    0, 0, DEBOUNCE_MAX, /* 5ms tick -> ~20ms debounce */
-  1500,
-  300,
-  0,
-  0,
-  0,
-  0,
-  },
-  {GPIOA, GPIO_PIN_4, 1,
-    0, 0, 4, /* 5ms tick -> ~20ms debounce */
- 1500,
- 300,
- 0,
- 0,
- 0,
- 0,
- },
-  {GPIOA, GPIO_PIN_5, 1,
-    0, 0, 4, /* 5ms tick -> ~20ms debounce */
- 1500,
- 300,
- 0,
- 0,
- 0,
- 0,
- },
+  }
 };
 
 

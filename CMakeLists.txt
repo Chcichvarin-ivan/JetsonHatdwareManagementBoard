@@ -35,7 +35,9 @@ enable_language(C ASM)
 add_executable(${CMAKE_PROJECT_NAME}
         Core/Src/debug_console.c
         Core/Inc/debug_console.h
-        Core/Inc/btn_def.h)
+        Core/Inc/btn_def.h
+        Core/Src/i2c_app.c
+        Core/Src/i2c_app.h)
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
