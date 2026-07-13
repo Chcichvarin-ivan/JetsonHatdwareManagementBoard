@@ -4,15 +4,12 @@
   * @file           : main.c
   * @brief          : Main program body
   ******************************************************************************
-  * @attention
-  *
-  * Copyright (c) 2026 STMicroelectronics.
-  * All rights reserved.
-  *
-  * This software is licensed under terms that can be found in the LICENSE file
-  * in the root directory of this software component.
-  * If no LICENSE file comes with this software, it is provided AS-IS.
-  *
+  * NOTE: Integrated with the actuation-circuit firmware (App/ modules).
+  *   - i2c_app.c/.h REMOVED (replaced by App/ i2c_reg.c + app.c).
+  *   - ledTask now drives the RGB status indicator (App_LedTick).
+  *   - buttonTask gesture engine kept as-is; it just reports liveness.
+  *   - App_Init() replaces I2C_SlaveApp_Init() and creates the FSM/telemetry
+  *     tasks. Pass &htim2 instead of NULL once TIM2 is added in CubeMX.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -27,34 +24,25 @@
 #include "FreeRTOS.h"
 #include "queue.h"
 #include "btn_def.h"
-#include "i2c_app.h"
+#include "app.h"          /* was: i2c_app.h */
+#include "app_config.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
 typedef StaticTask_t osStaticThreadDef_t;
 typedef StaticQueue_t osStaticMessageQDef_t;
 /* USER CODE BEGIN PTD */
-#define I2C_SLAVE_ADDRESS_7BIT   (0x12)  // pick a free address, Jetson uses this
-#define I2C_TX_MAX_BYTES         (1 + 2*16)  // 1 count + up to 16 events (2 bytes each)
-#define EVENT_RING_SIZE          64
-
 #define BUTTON_COUNT             1
-
-/* Debounce integrator parameters */
-#define DEBOUNCE_MAX             4   // larger = more stable, slower response
-
-/* Scan period */
+#define DEBOUNCE_MAX             4
 #define BUTTON_SCAN_PERIOD_MS    5
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
@@ -66,6 +54,8 @@ UART_HandleTypeDef huart2;
 DMA_HandleTypeDef hdma_usart2_tx;
 
 WWDG_HandleTypeDef hwwdg;
+
+TIM_HandleTypeDef htim2;   /* actuation: Ch.1/Ch.2 PWM + Ch.4 capture */
 
 /* Definitions for ledTask */
 osThreadId_t ledTaskHandle;
@@ -115,7 +105,6 @@ const osMessageQueueAttr_t g_hostCmdQueue_attributes = {
   .mq_size = sizeof(g_hostCmdQueueBuffer)
 };
 /* USER CODE BEGIN PV */
-
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -126,110 +115,75 @@ static void MX_I2C1_Init(void);
 static void MX_USART2_UART_Init(void);
 static void MX_WWDG_Init(void);
 static void MX_RNG_Init(void);
+static void MX_TIM2_Init(void);
 void StartLedTask(void *argument);
 void StartButtonTask(void *argument);
 void StartDebugTask(void *argument);
 
 /* USER CODE BEGIN PFP */
-
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
-
 /* USER CODE END 0 */
 
-/**
-  * @brief  The application entry point.
-  * @retval int
-  */
 int main(void)
 {
-
   /* USER CODE BEGIN 1 */
-
   /* USER CODE END 1 */
 
-  /* MCU Configuration--------------------------------------------------------*/
-
-  /* Reset of all peripherals, Initializes the Flash interface and the Systick. */
   HAL_Init();
 
   /* USER CODE BEGIN Init */
-
   /* USER CODE END Init */
 
-  /* Configure the system clock */
   SystemClock_Config();
 
   /* USER CODE BEGIN SysInit */
-
   /* USER CODE END SysInit */
 
-  /* Initialize all configured peripherals */
   MX_GPIO_Init();
   MX_DMA_Init();
   MX_I2C1_Init();
   MX_USART2_UART_Init();
   MX_WWDG_Init();
   MX_RNG_Init();
+  MX_TIM2_Init();
   /* USER CODE BEGIN 2 */
   /* USER CODE END 2 */
 
-  /* Init scheduler */
   osKernelInitialize();
 
   /* USER CODE BEGIN RTOS_MUTEX */
-  /* add mutexes, ... */
   /* USER CODE END RTOS_MUTEX */
-
   /* USER CODE BEGIN RTOS_SEMAPHORES */
-  /* add semaphores, ... */
   /* USER CODE END RTOS_SEMAPHORES */
-
   /* USER CODE BEGIN RTOS_TIMERS */
-  /* start timers, add new ones, ... */
   /* USER CODE END RTOS_TIMERS */
 
-  /* Create the queue(s) */
-  /* creation of g_hostCmdQueue */
   g_hostCmdQueueHandle = osMessageQueueNew (16, sizeof(uint8_t), &g_hostCmdQueue_attributes);
 
   /* USER CODE BEGIN RTOS_QUEUES */
-  /* add queues, ... */
   /* USER CODE END RTOS_QUEUES */
 
-  /* Create the thread(s) */
-  /* creation of ledTask */
   ledTaskHandle = osThreadNew(StartLedTask, NULL, &ledTask_attributes);
-
-  /* creation of buttonTask */
   buttonTaskHandle = osThreadNew(StartButtonTask, NULL, &buttonTask_attributes);
-
-  /* creation of debugTask */
   debugTaskHandle = osThreadNew(StartDebugTask, NULL, &debugTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
-  /* add threads, ... */
-
+  /* USER CODE END RTOS_THREADS */
 
   /* USER CODE BEGIN RTOS_EVENTS */
-  /* add events, ... */
-  I2C_SlaveApp_Init(&hi2c1);
+  /* Actuation-circuit firmware bring-up (TIM2 configured above). */
+  App_Init(&hi2c1, &htim2);
   /* USER CODE END RTOS_EVENTS */
 
-  /* Start scheduler */
   osKernelStart();
-
-  /* We should never get here as control is now taken by the scheduler */
-
-  /* Infinite loop */
-  /* USER CODE BEGIN WHILE */
 
   while (1)
   {
+    /* USER CODE BEGIN WHILE */
     /* USER CODE END WHILE */
-
     /* USER CODE BEGIN 3 */
   }
   /* USER CODE END 3 */
@@ -244,16 +198,11 @@ void SystemClock_Config(void)
   RCC_OscInitTypeDef RCC_OscInitStruct = {0};
   RCC_ClkInitTypeDef RCC_ClkInitStruct = {0};
 
-  /** Configure the main internal regulator output voltage
-  */
   if (HAL_PWREx_ControlVoltageScaling(PWR_REGULATOR_VOLTAGE_SCALE1) != HAL_OK)
   {
     Error_Handler();
   }
 
-  /** Initializes the RCC Oscillators according to the specified parameters
-  * in the RCC_OscInitTypeDef structure.
-  */
   RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;
   RCC_OscInitStruct.HSIState = RCC_HSI_ON;
   RCC_OscInitStruct.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
@@ -269,8 +218,6 @@ void SystemClock_Config(void)
     Error_Handler();
   }
 
-  /** Initializes the CPU, AHB and APB buses clocks
-  */
   RCC_ClkInitStruct.ClockType = RCC_CLOCKTYPE_HCLK|RCC_CLOCKTYPE_SYSCLK
                               |RCC_CLOCKTYPE_PCLK1|RCC_CLOCKTYPE_PCLK2;
   RCC_ClkInitStruct.SYSCLKSource = RCC_SYSCLKSOURCE_PLLCLK;
@@ -284,20 +231,11 @@ void SystemClock_Config(void)
   }
 }
 
-/**
-  * @brief I2C1 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_I2C1_Init(void)
 {
-
   /* USER CODE BEGIN I2C1_Init 0 */
-
   /* USER CODE END I2C1_Init 0 */
-
   /* USER CODE BEGIN I2C1_Init 1 */
-
   /* USER CODE END I2C1_Init 1 */
   hi2c1.Instance = I2C1;
   hi2c1.Init.Timing = 0x00B10E24;
@@ -312,44 +250,24 @@ static void MX_I2C1_Init(void)
   {
     Error_Handler();
   }
-
-  /** Configure Analogue filter
-  */
   if (HAL_I2CEx_ConfigAnalogFilter(&hi2c1, I2C_ANALOGFILTER_ENABLE) != HAL_OK)
   {
     Error_Handler();
   }
-
-  /** Configure Digital filter
-  */
   if (HAL_I2CEx_ConfigDigitalFilter(&hi2c1, 0) != HAL_OK)
   {
     Error_Handler();
   }
-
-  /** I2C Fast mode Plus enable
-  */
   HAL_I2CEx_EnableFastModePlus(I2C_FASTMODEPLUS_I2C1);
   /* USER CODE BEGIN I2C1_Init 2 */
-
   /* USER CODE END I2C1_Init 2 */
-
 }
 
-/**
-  * @brief RNG Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_RNG_Init(void)
 {
-
   /* USER CODE BEGIN RNG_Init 0 */
-
   /* USER CODE END RNG_Init 0 */
-
   /* USER CODE BEGIN RNG_Init 1 */
-
   /* USER CODE END RNG_Init 1 */
   hrng.Instance = RNG;
   if (HAL_RNG_Init(&hrng) != HAL_OK)
@@ -357,25 +275,14 @@ static void MX_RNG_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN RNG_Init 2 */
-
   /* USER CODE END RNG_Init 2 */
-
 }
 
-/**
-  * @brief USART2 Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_USART2_UART_Init(void)
 {
-
   /* USER CODE BEGIN USART2_Init 0 */
-
   /* USER CODE END USART2_Init 0 */
-
   /* USER CODE BEGIN USART2_Init 1 */
-
   /* USER CODE END USART2_Init 1 */
   huart2.Instance = USART2;
   huart2.Init.BaudRate = 115200;
@@ -394,25 +301,14 @@ static void MX_USART2_UART_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN USART2_Init 2 */
-
   /* USER CODE END USART2_Init 2 */
-
 }
 
-/**
-  * @brief WWDG Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_WWDG_Init(void)
 {
-
   /* USER CODE BEGIN WWDG_Init 0 */
-
   /* USER CODE END WWDG_Init 0 */
-
   /* USER CODE BEGIN WWDG_Init 1 */
-
   /* USER CODE END WWDG_Init 1 */
   hwwdg.Instance = WWDG;
   hwwdg.Init.Prescaler = WWDG_PRESCALER_8;
@@ -424,52 +320,45 @@ static void MX_WWDG_Init(void)
     Error_Handler();
   }
   /* USER CODE BEGIN WWDG_Init 2 */
-
   /* USER CODE END WWDG_Init 2 */
-
 }
 
-/**
-  * Enable DMA controller clock
-  */
 static void MX_DMA_Init(void)
 {
-
-  /* DMA controller clock enable */
   __HAL_RCC_DMA1_CLK_ENABLE();
-
-  /* DMA interrupt init */
-  /* DMA1_Channel7_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA1_Channel7_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA1_Channel7_IRQn);
-
 }
 
-/**
-  * @brief GPIO Initialization Function
-  * @param None
-  * @retval None
-  */
 static void MX_GPIO_Init(void)
 {
   GPIO_InitTypeDef GPIO_InitStruct = {0};
   /* USER CODE BEGIN MX_GPIO_Init_1 */
-
   /* USER CODE END MX_GPIO_Init_1 */
 
-  /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
 
-  /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LD3_Pin|LED_Pin, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : PA1 PA3 PA4 PA5 */
-  GPIO_InitStruct.Pin = GPIO_PIN_1|GPIO_PIN_3|GPIO_PIN_4|GPIO_PIN_5;
+  /* PA5 (A4): user button, active-low + pull-up.
+   * (SB16/SB18 removed on this board, so PA5 works as a normal GPIO.) */
+  GPIO_InitStruct.Pin = BTN_GPIO_PIN;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLUP;
   HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* PA4: Ch.3 external actuation sensor - EXTI rising edge */
+  GPIO_InitStruct.Pin = GPIO_PIN_4;
+  GPIO_InitStruct.Mode = GPIO_MODE_IT_RISING;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+  /* PA0/PA1/PA3 -> TIM2 CH1/CH2/CH4 (AF1); configured in HAL_TIM_Base_MspInit */
+
+  HAL_NVIC_SetPriority(EXTI4_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(EXTI4_IRQn);
 
   /*Configure GPIO pins : LD3_Pin LED_Pin */
   GPIO_InitStruct.Pin = LD3_Pin|LED_Pin;
@@ -479,11 +368,75 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
-
+  /* RGB status LEDs (App/rgb_led.c) self-configure their own pins in
+   * rgb_led_init(); nothing needed here unless you want them pre-driven. */
   /* USER CODE END MX_GPIO_Init_2 */
 }
 
 /* USER CODE BEGIN 4 */
+
+/* ------- Actuation timer TIM2: 1 us tick, 50 Hz; CH1/CH2 PWM, CH4 capture -------
+ * Hand-authored (regeneration-note in INTEGRATION.md). Enables clock, GPIO AF
+ * (PA0/PA1/PA3 = AF1_TIM2) and the TIM2 NVIC line in HAL_TIM_Base_MspInit. */
+void HAL_TIM_Base_MspInit(TIM_HandleTypeDef *htim)
+{
+  if (htim->Instance == TIM2)
+  {
+    GPIO_InitTypeDef g = {0};
+    __HAL_RCC_TIM2_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    /* PA0=CH1 (out), PA1=CH2 (out), PA3=CH4 (capture in) */
+    g.Pin = GPIO_PIN_0 | GPIO_PIN_1 | GPIO_PIN_3;
+    g.Mode = GPIO_MODE_AF_PP;
+    g.Pull = GPIO_NOPULL;
+    g.Speed = GPIO_SPEED_FREQ_LOW;
+    g.Alternate = GPIO_AF1_TIM2;
+    HAL_GPIO_Init(GPIOA, &g);
+
+    HAL_NVIC_SetPriority(TIM2_IRQn, 5, 0);
+    HAL_NVIC_EnableIRQ(TIM2_IRQn);
+  }
+}
+
+static void MX_TIM2_Init(void)
+{
+  TIM_ClockConfigTypeDef sClockSourceConfig = {0};
+  TIM_MasterConfigTypeDef sMasterConfig = {0};
+  TIM_OC_InitTypeDef sConfigOC = {0};
+  TIM_IC_InitTypeDef sConfigIC = {0};
+
+  htim2.Instance = TIM2;
+  htim2.Init.Prescaler = TIM2_PSC;                 /* 79 -> 1 MHz -> 1 us */
+  htim2.Init.CounterMode = TIM_COUNTERMODE_UP;
+  htim2.Init.Period = TIM2_ARR;                    /* 19999 -> 20 ms / 50 Hz */
+  htim2.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
+  htim2.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_ENABLE;
+  if (HAL_TIM_Base_Init(&htim2) != HAL_OK) { Error_Handler(); }
+
+  sClockSourceConfig.ClockSource = TIM_CLOCKSOURCE_INTERNAL;
+  if (HAL_TIM_ConfigClockSource(&htim2, &sClockSourceConfig) != HAL_OK) { Error_Handler(); }
+
+  if (HAL_TIM_PWM_Init(&htim2) != HAL_OK) { Error_Handler(); }
+  if (HAL_TIM_IC_Init(&htim2) != HAL_OK) { Error_Handler(); }
+
+  sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
+  sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
+  if (HAL_TIMEx_MasterConfigSynchronization(&htim2, &sMasterConfig) != HAL_OK) { Error_Handler(); }
+
+  sConfigOC.OCMode = TIM_OCMODE_PWM1;
+  sConfigOC.Pulse = US_STANDBY;                    /* initial 1150 us */
+  sConfigOC.OCPolarity = TIM_OCPOLARITY_HIGH;
+  sConfigOC.OCFastMode = TIM_OCFAST_DISABLE;
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_1) != HAL_OK) { Error_Handler(); }
+  if (HAL_TIM_PWM_ConfigChannel(&htim2, &sConfigOC, TIM_CHANNEL_2) != HAL_OK) { Error_Handler(); }
+
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
+  sConfigIC.ICFilter = 0;
+  if (HAL_TIM_IC_ConfigChannel(&htim2, &sConfigIC, TIM_CHANNEL_4) != HAL_OK) { Error_Handler(); }
+  /* PWM start / capture start are issued by pwm_out_init() and telemetry_init(). */
+}
 
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart)
 {
@@ -497,60 +450,33 @@ void HAL_UART_TxCpltCallback(UART_HandleTypeDef *huart)
 
 void HAL_WWDG_EarlyWakeupCallback(WWDG_HandleTypeDef *hwwdg)
 {
-  // This callback fires when the counter reaches the EWI threshold,
-  // which is inside the allowed refresh window.
-
-    // Refresh back to 0x7F (or whatever counter you configured)
+  /* Refresh ONLY while every required task is alive. A hung task stops the
+   * refresh and the WWDG resets the MCU. */
+  if (App_WwdgShouldRefresh())
+  {
     HAL_WWDG_Refresh(hwwdg);
+  }
 }
 /* USER CODE END 4 */
 
 /* USER CODE BEGIN Header_StartLedTask */
-/* =========================
-   Jetson -> Nucleo command protocol (I2C master write)
-   ========================= */
-
-
-typedef struct {
-  uint8_t cmd;
-  uint8_t value;
-} HostCommand;
 /**
-  * @brief  Function implementing the ledTask thread.
-  * @param  argument: Not used
-  * @retval None
+  * @brief  ledTask now drives the RGB status indicator via App_LedTick().
   */
-static uint8_t LedState;
-void setLedState(uint8_t in_state) {
-  LedState = in_state;
-}
 /* USER CODE END Header_StartLedTask */
 void StartLedTask(void *argument)
 {
   /* USER CODE BEGIN 5 */
-  /* Infinite loop */
+  (void)argument;
   for(;;)
   {
-    osDelay(pdMS_TO_TICKS(500));
-
-    HAL_GPIO_TogglePin( LD3_GPIO_Port, LD3_Pin);
-    if (LedState ==  I2C_SLAVE_LED_ON) {
-      HAL_GPIO_WritePin(GPIOB, LED_Pin, GPIO_PIN_SET);
-      /* USER CODE END RTOS_THREADS */
-    }else if (LedState ==   I2C_SLAVE_LED_FLASH2H) {
-      HAL_GPIO_TogglePin(GPIOB, LED_Pin);
-    }else if (LedState == I2C_SLAVE_LED_OFF){
-      HAL_GPIO_WritePin(GPIOB, LED_Pin, GPIO_PIN_RESET);
-    }else if (LedState == I2C_SLAVE_LED_SHTDWN) {
-      HAL_GPIO_WritePin(GPIOB, LED_Pin, GPIO_PIN_RESET);
-    }
-
+    App_LedTick();
+    osDelay(pdMS_TO_TICKS(RGBLED_PERIOD_MS));
   }
   /* USER CODE END 5 */
 }
 
 /* USER CODE BEGIN Header_StartButtonTask */
-
 
 #define BTN_EVENT_Q_LEN  16
 
@@ -558,7 +484,6 @@ static StaticQueue_t g_btnQStruct;
 static uint8_t g_btnQStorage[BTN_EVENT_Q_LEN * sizeof(btn_event_msg_t)];
 static QueueHandle_t g_btnQ = NULL;
 
-/* Create queue once at init (task context) */
 static void BTN_EventQueueInit(void)
 {
   if (g_btnQ) return;
@@ -570,85 +495,55 @@ static void BTN_EventQueueInit(void)
   );
 }
 
-/* Get handle so other tasks can receive events */
 QueueHandle_t BTN_GetEventQueue(void)
 {
   return g_btnQ;
 }
 
-/* Post event (task context). Non-blocking. */
 static void BTN_PostEvent(btn_evt_type_t type, uint16_t pin, uint32_t now_ms)
 {
-  if (!g_btnQ) return;
-
   btn_event_msg_t e = {.type = type, .pin = pin, .t_ms = now_ms};
-  (void)xQueueSend(g_btnQ, &e, 0); /* 0 tick wait: drop if full */
+  /* 1) debug console `btn session` reads this queue */
+  if (g_btnQ) (void)xQueueSend(g_btnQ, &e, 0);
+  /* 2) actuation FSM gets its own copy (safety actions never stolen) */
+  App_PostButtonEvent(&e);
 }
-/* =========================
-   Debounce state (integrator)
-   ========================= */
 
 typedef struct
 {
   GPIO_TypeDef *port;
   uint16_t      pin;
   uint8_t       active_low;
-  /* ---- Debounce integrator ----
-   * stable: debounced level (0=not pressed, 1=pressed)
-   * integ:  integrator 0..db_max
-   */
-  uint8_t stable;     /* 0=not pressed, 1=pressed (debounced) */
-  uint8_t integ;      /* 0..db_max */
-  uint8_t db_max;     /* threshold: e.g. 4 for ~20ms at 5ms sampling */
-
-  /* ---- Gesture timing ---- */
-  uint32_t long_press_ms;      /* e.g. 800 */
-  uint32_t double_window_ms;   /* e.g. 300 */
-  uint32_t pressed_at_ms;      /* when stable became pressed */
+  uint8_t stable;
+  uint8_t integ;
+  uint8_t db_max;
+  uint32_t long_press_ms;
+  uint32_t double_window_ms;
+  uint32_t pressed_at_ms;
   uint8_t  long_fired;
-
-  /* ---- Double press tracking ---- */
   uint8_t  waiting_second;
   uint32_t first_release_ms;
 } btn_t;
 
-/* =========================
-   Button pin mapping
-   Update these to match your board wiring / CubeMX config.
-   NOTE: NUCLEO-L432KC has a user button B1 on PA0 on some Nucleo boards,
-         but L432KC Nucleo-32 variants vary. Use your actual pins.
-   ========================= */
 static btn_t g_db[BUTTON_COUNT] = {
-  {GPIOA, GPIO_PIN_1,1,
-      0, 0, DEBOUNCE_MAX, /* 5ms tick -> ~20ms debounce */
+  {BTN_GPIO_PORT, BTN_GPIO_PIN, 1,   /* button PA5/A4 (SB16/SB18 removed) */
+    0, 0, DEBOUNCE_MAX,
     1200,
     300,
-    0,
-    0,
-    0,
-    0,
+    0, 0, 0, 0,
   }
 };
 
-
-/* Read raw button (pressed=true/false) */
 static inline uint8_t btn_read_raw_pressed(GPIO_TypeDef *port, uint16_t pin, uint8_t active_low)
 {
   uint8_t level = (HAL_GPIO_ReadPin(port, pin) == GPIO_PIN_SET) ? 1u : 0u;
-  return active_low ? (uint8_t)(!level) : level; /* pressed=1 */
+  return active_low ? (uint8_t)(!level) : level;
 }
 
 static uint8_t btn_debounce_update(btn_t *b, uint8_t raw_pressed)
 {
-  if (raw_pressed)
-  {
-    if (b->integ < b->db_max) b->integ++;
-  }
-  else
-  {
-    if (b->integ > 0) b->integ--;
-  }
-
+  if (raw_pressed) { if (b->integ < b->db_max) b->integ++; }
+  else             { if (b->integ > 0)         b->integ--; }
   if (b->integ == b->db_max && b->stable == 0) { b->stable = 1; return 1; }
   if (b->integ == 0 && b->stable == 1)         { b->stable = 0; return 1; }
   return 0;
@@ -659,37 +554,28 @@ void BTN_UpdateAndPost(btn_t *b, uint32_t now_ms)
   uint8_t raw = btn_read_raw_pressed(b->port, b->pin, b->active_low);
   uint8_t changed = btn_debounce_update(b, raw);
 
-  /* Debounced press edge */
   if (changed && b->stable == 1)
   {
     b->pressed_at_ms = now_ms;
     b->long_fired = 0;
-    /* do not post anything yet (short press is decided later) */
   }
 
-  /* Long press detection while held */
   if (b->stable == 1 && !b->long_fired)
   {
     if ((now_ms - b->pressed_at_ms) >= b->long_press_ms)
     {
       b->long_fired = 1;
-      b->waiting_second = 0; /* long cancels double */
+      b->waiting_second = 0;
       BTN_PostEvent(BTN_EVT_LONG_PRESS, b->pin, now_ms);
     }
   }
 
-  /* Debounced release edge */
   if (changed && b->stable == 0)
   {
-    if (b->long_fired)
-    {
-      /* already reported LONG; release produces no event */
-      return;
-    }
+    if (b->long_fired) { return; }
 
     if (b->waiting_second)
     {
-      /* second click release within window => DOUBLE */
       if ((now_ms - b->first_release_ms) <= b->double_window_ms)
       {
         b->waiting_second = 0;
@@ -697,20 +583,17 @@ void BTN_UpdateAndPost(btn_t *b, uint32_t now_ms)
       }
       else
       {
-        /* too late: treat as "new first" */
         b->first_release_ms = now_ms;
         b->waiting_second = 1;
       }
     }
     else
     {
-      /* first short click released: start window */
       b->waiting_second = 1;
       b->first_release_ms = now_ms;
     }
   }
 
-  /* Finalize single short press when window expires (no second press) */
   if (b->waiting_second && b->stable == 0)
   {
     if ((now_ms - b->first_release_ms) > b->double_window_ms)
@@ -720,24 +603,17 @@ void BTN_UpdateAndPost(btn_t *b, uint32_t now_ms)
     }
   }
 }
-/**
-* @brief Function implementing the buttonTask thread.
-* @param argument: Not used
-* @retval None
-*/
 /* USER CODE END Header_StartButtonTask */
 void StartButtonTask(void *argument)
 {
   /* USER CODE BEGIN StartButtonTask */
   (void)argument;
 
-  BTN_EventQueueInit(); /* create queue once */
-  /* Initialize debounce states */
-  /* Infinite loop */
+  BTN_EventQueueInit();
   uint32_t now_ms = 0;
   for(;;)
   {
-
+    App_NoteButtonAlive();   /* watchdog liveness */
     for (uint32_t i = 0; i < BUTTON_COUNT; i++) {
       now_ms = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS);
       BTN_UpdateAndPost(&g_db[i], now_ms);
@@ -748,11 +624,6 @@ void StartButtonTask(void *argument)
 }
 
 /* USER CODE BEGIN Header_StartDebugTask */
-/**
-* @brief Function implementing the debugTask thread.
-* @param argument: Not used
-* @retval None
-*/
 /* USER CODE END Header_StartDebugTask */
 void StartDebugTask(void *argument)
 {
@@ -770,9 +641,7 @@ void StartDebugTask(void *argument)
     .default_timestamps = 0,
     .default_prompt = 1,
   };
-
   DBG_Init(&cfg);
-  /* Infinite loop */
   for(;;)
   {
     osDelay(1);
@@ -780,55 +649,32 @@ void StartDebugTask(void *argument)
   /* USER CODE END StartDebugTask */
 }
 
-/**
-  * @brief  Period elapsed callback in non blocking mode
-  * @note   This function is called  when TIM1 interrupt took place, inside
-  * HAL_TIM_IRQHandler(). It makes a direct call to HAL_IncTick() to increment
-  * a global variable "uwTick" used as application time base.
-  * @param  htim : TIM handle
-  * @retval None
-  */
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
   /* USER CODE BEGIN Callback 0 */
-
   /* USER CODE END Callback 0 */
   if (htim->Instance == TIM1)
   {
     HAL_IncTick();
   }
   /* USER CODE BEGIN Callback 1 */
-
   /* USER CODE END Callback 1 */
 }
 
-/**
-  * @brief  This function is executed in case of error occurrence.
-  * @retval None
-  */
 void Error_Handler(void)
 {
   /* USER CODE BEGIN Error_Handler_Debug */
-  /* User can add his own implementation to report the HAL error return state */
   __disable_irq();
   while (1)
   {
   }
   /* USER CODE END Error_Handler_Debug */
 }
+
 #ifdef USE_FULL_ASSERT
-/**
-  * @brief  Reports the name of the source file and the source line number
-  *         where the assert_param error has occurred.
-  * @param  file: pointer to the source file name
-  * @param  line: assert_param error line source number
-  * @retval None
-  */
 void assert_failed(uint8_t *file, uint32_t line)
 {
   /* USER CODE BEGIN 6 */
-  /* User can add his own implementation to report the file name and line number,
-     ex: printf("Wrong parameters value: file %s on line %d\r\n", file, line) */
   /* USER CODE END 6 */
 }
 #endif /* USE_FULL_ASSERT */
