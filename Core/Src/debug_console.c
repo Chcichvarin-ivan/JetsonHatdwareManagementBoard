@@ -14,6 +14,8 @@
 
 #include "cmsis_os2.h"
 #include "btn_def.h"
+#include "app.h"
+#include "app_config.h"
 /* ============================================================================
  * Compile-time tunables
  * ============================================================================
@@ -454,6 +456,9 @@ static int rx_line_is_valid_cmd_prefix(const uint8_t *s, uint16_t n)
   if (TOK_EQ("clear")) return 1;
   if (TOK_EQ("reset")) return 1;
   if (TOK_EQ("btn")) return 1;
+#if APP_ENABLE_ACT_TEST
+  if (TOK_EQ("ext")) return 1;
+#endif
   if (TOK_EQ("i2c")) return 1;
   if (TOK_EQ("mem")) return 1;
   if (TOK_EQ("txstat")) return 1;
@@ -1135,6 +1140,10 @@ static void print_help(void)
     "  clear\r\n"
     "  reset\r\n"
     "  btn\r\n"
+#if APP_ENABLE_ACT_TEST
+    "  ext status|standby|pump|arm|fire|disarm|clearfault|failsafe\r\n"
+    "  ext hb <alt_dm> <spd_cms> [flags] | ext sim on|off | ext cfg <amin> <amax> <smax>\r\n"
+#endif
     "  i2c scan\r\n"
     "  i2c rd <addr7> <reg> <len>\r\n"
     "  i2c wr <addr7> <reg> <b1> [b2...]\r\n"
@@ -1360,6 +1369,86 @@ static void handle_line(char *line)
     cli_print_prompt();
     return;
   }
+
+#if APP_ENABLE_ACT_TEST
+  /* Fire-extinguishing / actuation bench test.
+   * These drive the REAL FSM through the REAL interlocks: ACTUATE only fires
+   * when armed AND the envelope permit is satisfied. Bench use only -- keep
+   * the nozzle depressurised / pointed to a safe place. */
+  if (strcmp(tok[0], "ext") == 0)
+  {
+    if (n < 2)
+    {
+      DBG_Puts("usage: ext status|standby|pump|arm|fire|disarm|clearfault|failsafe\r\n"
+               "       ext hb <alt_dm> <spd_cms> [flags]\r\n"
+               "       ext sim on <alt_dm> <spd_cms> [flags] | ext sim off\r\n"
+               "       ext cfg <alt_min_dm> <alt_max_dm> <spd_max_cms>\r\n"
+               "       (alt in 0.1 m, spd in 0.01 m/s; flags default 0x03=NAV|MISSION)\r\n");
+    }
+    else if (!strcmp(tok[1], "status"))
+    {
+      app_test_status_t st;
+      App_TestGetStatus(&st);
+      DBG_Printf("FSM=%u TLM=%u(%uus) FAULT=0x%04X PERMIT=0x%02X HBage=%ums CH1=%uus CH2=%uus ARMleft=%ums\r\n",
+                 st.fsm, st.tlm_state, st.tlm_us, st.fault, st.permit,
+                 (unsigned)st.hb_age10 * 10u, st.ch1_us, st.ch2_us,
+                 (unsigned)st.arm_left100 * 100u);
+    }
+    else if (!strcmp(tok[1], "standby"))    { DBG_Puts(App_TestStandby()    ? "[ext] -> STANDBY\r\n"     : "[ext] queue full\r\n"); }
+    else if (!strcmp(tok[1], "pump"))       { DBG_Puts(App_TestPump()       ? "[ext] -> PUMP\r\n"        : "[ext] queue full\r\n"); }
+    else if (!strcmp(tok[1], "arm"))        { DBG_Puts(App_TestArm()        ? "[ext] -> ARM (needs permit + TLM_READY)\r\n" : "[ext] queue full\r\n"); }
+    else if (!strcmp(tok[1], "fire"))       { DBG_Puts(App_TestFire()       ? "[ext] -> ACTUATE (only if armed + ACTUATE_ALLOWED)\r\n" : "[ext] queue full\r\n"); }
+    else if (!strcmp(tok[1], "disarm"))     { DBG_Puts(App_TestDisarm()     ? "[ext] -> DISARM\r\n"      : "[ext] queue full\r\n"); }
+    else if (!strcmp(tok[1], "clearfault")) { DBG_Puts(App_TestClearFault() ? "[ext] -> CLEAR_FAULT\r\n" : "[ext] queue full\r\n"); }
+    else if (!strcmp(tok[1], "failsafe"))   { DBG_Puts(App_TestFailsafe()   ? "[ext] -> FAILSAFE\r\n"    : "[ext] queue full\r\n"); }
+    else if (!strcmp(tok[1], "hb"))
+    {
+      if (n < 4) DBG_Puts("usage: ext hb <alt_dm> <spd_cms> [flags]\r\n");
+      else
+      {
+        uint16_t alt = (uint16_t)strtol(tok[2], NULL, 0);
+        uint16_t spd = (uint16_t)strtol(tok[3], NULL, 0);
+        uint8_t  fl  = (n >= 5) ? (uint8_t)strtol(tok[4], NULL, 0) : 0x03u;
+        App_TestHeartbeat(alt, spd, fl);
+        DBG_Printf("[ext] hb alt=%u spd=%u flags=0x%02X\r\n", alt, spd, fl);
+      }
+    }
+    else if (!strcmp(tok[1], "sim"))
+    {
+      if (n >= 3 && !strcmp(tok[2], "off"))
+      {
+        App_TestHeartbeatAuto(0, 0, 0, 0);
+        DBG_Puts("[ext] sim off\r\n");
+      }
+      else if (n >= 5 && !strcmp(tok[2], "on"))
+      {
+        uint16_t alt = (uint16_t)strtol(tok[3], NULL, 0);
+        uint16_t spd = (uint16_t)strtol(tok[4], NULL, 0);
+        uint8_t  fl  = (n >= 6) ? (uint8_t)strtol(tok[5], NULL, 0) : 0x03u;
+        App_TestHeartbeatAuto(1, alt, spd, fl);
+        DBG_Printf("[ext] sim on @10Hz alt=%u spd=%u flags=0x%02X\r\n", alt, spd, fl);
+      }
+      else DBG_Puts("usage: ext sim on <alt_dm> <spd_cms> [flags] | ext sim off\r\n");
+    }
+    else if (!strcmp(tok[1], "cfg"))
+    {
+      if (n < 5) DBG_Puts("usage: ext cfg <alt_min_dm> <alt_max_dm> <spd_max_cms>\r\n");
+      else
+      {
+        uint16_t amin = (uint16_t)strtol(tok[2], NULL, 0);
+        uint16_t amax = (uint16_t)strtol(tok[3], NULL, 0);
+        uint16_t smax = (uint16_t)strtol(tok[4], NULL, 0);
+        App_TestConfig(amin, amax, smax);
+        DBG_Printf("[ext] corridor alt[%u..%u] spd<=%u\r\n", amin, amax, smax);
+      }
+    }
+    else DBG_Puts("unknown ext subcmd; try: ext status\r\n");
+
+    cli_print_latency(t0);
+    cli_print_prompt();
+    return;
+  }
+#endif /* APP_ENABLE_ACT_TEST */
 
   /* I2C */
   if (strcmp(tok[0], "i2c") == 0)
