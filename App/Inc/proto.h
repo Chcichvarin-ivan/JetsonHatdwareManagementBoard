@@ -23,7 +23,7 @@
 #define REG_SENSOR_STATE    0x06
 #define REG_LAST_RESULT     0x07
 #define REG_SEQ_ECHO        0x08
-#define REG_ARM_TIME_LEFT   0x09  /* x100 ms */
+#define REG_ARM_TIME_LEFT   0x09  /* deprecated (auto-arm model): always 0 */
 #define REG_CH1_PULSE_US    0x0A  /* u16 LE */
 #define REG_CH2_PULSE_US    0x0C  /* u16 LE */
 #define REG_FAULT_FLAGS     0x0E  /* u16 LE */
@@ -49,8 +49,8 @@
 #define OP_NOP              0x00
 #define OP_SET_STANDBY      0x10
 #define OP_PUMP             0x20
-#define OP_ARM              0x30
-#define OP_ACTUATE          0x31
+#define OP_ARM              0x30  /* deprecated: auto-arm on pump confirm; ACK only if already ARMED */
+#define OP_ACTUATE          0x31  /* ARG must equal 0x1825 (ACTUATE_ARG_KEY) unless disabled */
 #define OP_DISARM           0x40
 #define OP_CLEAR_FAULT      0x50
 #define OP_FORCE_FAILSAFE   0xF0
@@ -90,7 +90,10 @@ typedef enum {
 #define PERMIT_SPD_OK          (1u << 3)
 #define PERMIT_MISSION         (1u << 4)
 #define PERMIT_ARMED           (1u << 5)
-#define PERMIT_TLM_READY       (1u << 6)
+#define PERMIT_TLM_READY       (1u << 6)  /* pump stage passed (FSM latch) AND
+                                              telemetry alive & non-error; the
+                                              circuit's READY level itself is
+                                              transient, not held */
 #define PERMIT_ACTUATE_ALLOWED (1u << 7)
 /* Base conditions that must hold to ARM and to remain ARMED */
 #define PERMIT_ARM_MASK  (PERMIT_HB_FRESH | PERMIT_NAV_VALID | PERMIT_ALT_OK | \
@@ -102,13 +105,14 @@ typedef enum {
 #define FAULT_POWER_ERROR        (1u << 2)
 #define FAULT_CRC_ERROR          (1u << 3)
 #define FAULT_SEQ_GAP            (1u << 4)
-#define FAULT_ARM_TIMEOUT        (1u << 5)
+#define FAULT_ARM_TIMEOUT        (1u << 5)   /* reserved (no arm window anymore) */
 #define FAULT_SENSOR_UNEXPECTED  (1u << 6)
 #define FAULT_INTERNAL           (1u << 7)
-#define FAULT_ENVELOPE_VIOLATION (1u << 8)
+#define FAULT_ENVELOPE_VIOLATION (1u << 8)   /* reserved (violation now only blocks ACTUATE) */
 #define FAULT_HB_STALE           (1u << 9)
 #define FAULT_HB_CRC_ERROR       (1u << 10)
 #define FAULT_CONFIG_MISSING     (1u << 11)
+#define FAULT_PUMP_NOACK         (1u << 12)  /* pump command never confirmed by telemetry */
 
 /* --------------------------- Heartbeat flags ------------------------------ */
 #define HB_FLAG_NAV_VALID  (1u << 0)

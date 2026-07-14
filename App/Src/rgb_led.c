@@ -40,7 +40,8 @@ void rgb_led_init(void)
 
 /* Priority resolve (first match wins). Pure colours only.
  *   RED   fast  = FAULT
- *   BLUE  fast  = link/heartbeat lost (also BOOT: no link yet)
+ *   BLUE  solid = awaiting first host contact (healthy; Jetson still booting)
+ *   BLUE  fast  = link/heartbeat LOST after contact was established
  *   RED   solid = ACTUATING (firing now)
  *   RED   slow  = FAILSAFE (commanded/ button, link still OK)
  *   GREEN fast  = ARMED (caution: armed, not yet firing)
@@ -48,9 +49,11 @@ void rgb_led_init(void)
  *   BLUE  slow  = PUMPING (working)
  *   GREEN solid = STANDBY (idle, healthy)
  */
-static color_t resolve(uint8_t fsm, uint16_t fault, uint8_t hb_fresh, pattern_t *pat)
+static color_t resolve(uint8_t fsm, uint16_t fault, uint8_t hb_fresh,
+                       uint8_t link_seen, pattern_t *pat)
 {
     if (fsm == FSM_FAULT)                                    { *pat = PAT_FAST;  return C_RED;   }
+    if (!link_seen)                                          { *pat = PAT_SOLID; return C_BLUE;  }
     if (!hb_fresh || (fault & (FAULT_COMMS_TIMEOUT | FAULT_HB_STALE)))
                                                              { *pat = PAT_FAST;  return C_BLUE;  }
     if (fsm == FSM_ACTUATING)                                { *pat = PAT_SOLID; return C_RED;   }
@@ -73,7 +76,8 @@ static uint8_t pattern_on(pattern_t pat, uint32_t now_ms)
 }
 
 void rgb_led_update(uint32_t now_ms, uint8_t fsm_state, uint16_t fault_flags,
-                    uint8_t hb_fresh, uint8_t btn_code, uint8_t btn_seq)
+                    uint8_t hb_fresh, uint8_t link_seen,
+                    uint8_t btn_code, uint8_t btn_seq)
 {
 #if APP_BTN_MODE
     /* Show a short colour blip whenever a new button gesture is reported, so a
@@ -100,6 +104,6 @@ void rgb_led_update(uint32_t now_ms, uint8_t fsm_state, uint16_t fault_flags,
     (void)btn_code; (void)btn_seq;
 #endif
     pattern_t pat;
-    color_t c = resolve(fsm_state, fault_flags, hb_fresh, &pat);
+    color_t c = resolve(fsm_state, fault_flags, hb_fresh, link_seen, &pat);
     drive(c, pattern_on(pat, now_ms));
 }

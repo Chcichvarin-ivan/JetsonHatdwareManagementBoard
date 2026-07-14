@@ -19,9 +19,11 @@ static QueueHandle_t s_btn_q;   /* fetched at runtime from the button engine */
 
 static fsm_state_t s_state;
 static uint32_t    s_enter_ms;
-static uint32_t    s_arm_deadline;
 static uint8_t     s_last_seq;
 static uint8_t     s_seq_seen;
+static uint8_t     s_tlm_err_active;     /* ERROR debounce tracking */
+static uint32_t    s_tlm_err_since;
+static uint32_t    s_fault_clear_since;  /* pre-host self-heal timer */
 
 static void enter(fsm_state_t st, uint32_t now_ms)
 {
@@ -68,22 +70,23 @@ static void handle_command(const app_command_t *cmd, uint32_t now_ms,
         else result = RES_NACK;
         break;
     case OP_ARM:
-        if (s_state == FSM_READY && (permit & PERMIT_ARM_MASK) == PERMIT_ARM_MASK) {
-            s_arm_deadline = now_ms + ARM_WINDOW_MS;
-            pwm_set_ch2_us(US_STANDBY);
-            enter(FSM_ARMED, now_ms);
-        } else result = RES_NACK;
+        /* Deprecated: arming is automatic on pump confirmation. Kept as an
+         * idempotent probe: ACK if already armed, NACK otherwise. */
+        if (s_state != FSM_ARMED) result = RES_NACK;
         break;
     case OP_ACTUATE:
-        if (s_state == FSM_ARMED && (permit & PERMIT_ACTUATE_ALLOWED)) {
+        if (s_state == FSM_ARMED && (permit & PERMIT_ACTUATE_ALLOWED)
+#if ACTUATE_REQUIRE_KEY
+            && cmd->arg == ACTUATE_ARG_KEY
+#endif
+           ) {
             pwm_set_ch2_us(US_ACTUATE);
             sensor_as_clear();
             enter(FSM_ACTUATING, now_ms);
         } else result = RES_NACK;
         break;
     case OP_DISARM:
-        if (s_state == FSM_ARMED)      enter(FSM_READY, now_ms);
-        else if (s_state != FSM_FAULT) to_standby(now_ms);
+        if (s_state != FSM_FAULT) to_standby(now_ms);   /* ARMED incl.: back to standby */
         break;
     case OP_CLEAR_FAULT:
         if (!fault_source_active(tlm_state)) {
@@ -171,8 +174,24 @@ void actuation_task(void *arg)
 
         if (sensor_as_triggered()) status_set_sensor(1);
 
-        /* highest-priority safety transitions */
-        if (tlm == TLM_ERROR && s_state != FSM_FAULT) {
+        /* highest-priority safety transitions.
+         * TLM ERROR is DEBOUNCED before faulting: at a simultaneous power-up
+         * the circuit runs its own startup while our pins settle, and may emit
+         * or briefly latch its error state. A single reading must not brick
+         * the board. ERROR must persist TLM_ERROR_CONFIRM_MS, and during BOOT
+         * the first BOOT_TLM_SETTLE_MS are ignored entirely. */
+        uint8_t tlm_err_confirmed = 0;
+        if (tlm == TLM_ERROR) {
+            if (!s_tlm_err_active) { s_tlm_err_active = 1; s_tlm_err_since = now; }
+            uint8_t settled = (s_state != FSM_BOOT) ||
+                              ((now - s_enter_ms) > BOOT_TLM_SETTLE_MS);
+            tlm_err_confirmed = (settled &&
+                (now - s_tlm_err_since) >= TLM_ERROR_CONFIRM_MS) ? 1u : 0u;
+        } else {
+            s_tlm_err_active = 0;
+        }
+        if (tlm_err_confirmed && s_state != FSM_FAULT) {
+            fault_set(FAULT_POWER_ERROR);
             to_fault(now);
         } else if (!link_ok && s_state != FSM_FAILSAFE && s_state != FSM_FAULT
                    && s_state != FSM_ACTUATING) {
@@ -203,29 +222,34 @@ void actuation_task(void *arg)
             break;
         case FSM_STANDBY:
             break;
-        case FSM_PUMPING:
-            if ((now - s_enter_ms) >= PUMP_MIN_HOLD_MS) {
-                pwm_set_ch1_us(US_STANDBY);
-                if (tlm == TLM_READY) enter(FSM_READY, now);
-            }
-            break;
-        case FSM_READY:
-            break;
-        case FSM_ARMED: {
-            uint32_t left = (s_arm_deadline > now) ? (s_arm_deadline - now) : 0;
-            uint32_t left10 = left / 100u;
-            status_set_arm_time_left(left10 > 255u ? 255u : (uint8_t)left10);
-            if ((permit & PERMIT_ARM_MASK) != PERMIT_ARM_MASK) {
-                fault_set(FAULT_ENVELOPE_VIOLATION);
-                enter(FSM_READY, now);          /* auto-disarm */
-            } else if (now >= s_arm_deadline) {
-                fault_set(FAULT_ARM_TIMEOUT);
-                enter(FSM_READY, now);
+        case FSM_PUMPING: {
+            /* Hold Ch.1 = 1650 us until the circuit confirms (TLM READY).
+             * PUMP_MIN_HOLD_MS is the spec MINIMUM ("hold >= 2.0 s"), not the
+             * total: releasing at exactly 2 s while telemetry is still IDLE
+             * deadlocks the sequence (circuit never confirms a command that is
+             * no longer present). A confirmation timeout returns to standby
+             * with FAULT_PUMP_NOACK so the failure is visible, not silent. */
+            uint32_t held = now - s_enter_ms;
+            if (tlm == TLM_READY && held >= (PUMP_MIN_HOLD_MS + PWM_LATCH_MARGIN_MS)) {
+                enter(FSM_ARMED, now);   /* AUTO-ARM on hardware confirmation */
+            } else if (held >= PUMP_CONFIRM_TIMEOUT_MS) {
+                fault_set(FAULT_PUMP_NOACK);
+                to_standby(now);
             }
             break;
         }
+        case FSM_READY:      /* legacy state, unreachable in the auto-arm model */
+            break;
+        case FSM_ARMED:
+            /* Indefinite: firing is gated by the LIVE permit at ACTUATE time
+             * (PERMIT_FLAGS reflects it continuously); leaving the corridor
+             * simply blocks ACTUATE, it no longer kicks the state machine. */
+            status_set_arm_time_left(0);
+            break;
         case FSM_ACTUATING:
-            if ((now - s_enter_ms) >= ACTUATE_MIN_HOLD_MS) {  /* never cut short */
+            /* +PWM_LATCH_MARGIN_MS guarantees the PHYSICAL 1825 us level meets
+             * the >= 200 ms spec despite CCR-preload phase alignment. */
+            if ((now - s_enter_ms) >= (ACTUATE_MIN_HOLD_MS + PWM_LATCH_MARGIN_MS)) {  /* never cut short */
                 if (sensor_as_triggered()) status_set_sensor(1);
                 if (!link_ok) to_failsafe(now);
                 else          to_standby(now);
@@ -237,6 +261,22 @@ void actuation_task(void *arg)
             break;
         case FSM_FAULT:
             status_set_arm_time_left(0);
+            /* Pre-host self-heal: a FAULT entered before ANY host contact
+             * (standalone power-up ordering) must not brick the board until a
+             * Jetson arrives to send CLEAR_FAULT. If the telemetry error has
+             * cleared and stayed clear, recover to STANDBY autonomously.
+             * After first host contact, recovery is host-owned as designed. */
+            if (!comms_seen() && !s_tlm_err_active &&
+                tlm != TLM_ERROR && tlm != TLM_UNKNOWN) {
+                if (s_fault_clear_since == 0u) s_fault_clear_since = now;
+                if ((now - s_fault_clear_since) >= FAULT_SELF_HEAL_MS) {
+                    fault_clear(0xFFFFu & ~FAULT_CONFIG_MISSING);
+                    s_fault_clear_since = 0u;
+                    to_standby(now);
+                }
+            } else {
+                s_fault_clear_since = 0u;
+            }
             break;
         default:
             to_failsafe(now);

@@ -11,7 +11,11 @@
 #include <stdint.h>
 
 void rgb_led_init(void);
+/* link_seen: 1 once any valid frame has ever arrived (comms_seen()). Before
+ * that, missing heartbeat freshness shows as "awaiting host" (blue SOLID) —
+ * a healthy waiting state — not as the link-lost alarm (blue FAST). */
 void rgb_led_update(uint32_t now_ms, uint8_t fsm_state, uint16_t fault_flags,
-                    uint8_t hb_fresh, uint8_t btn_code, uint8_t btn_seq);
+                    uint8_t hb_fresh, uint8_t link_seen,
+                    uint8_t btn_code, uint8_t btn_seq);
 
 #endif /* RGB_LED_H */

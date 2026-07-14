@@ -71,6 +71,8 @@ void telemetry_tick(uint32_t now_ms)
     } else {
         fault_clear(FAULT_TLM_TIMEOUT);
     }
-    if (s_state == TLM_ERROR) fault_set(FAULT_POWER_ERROR);
+    /* FAULT_POWER_ERROR is latched by the supervisor only after the ERROR
+     * state is CONFIRMED (debounced) — see actuation.c. A single reading
+     * during the circuit's own power-up must not latch a fault. */
     status_set_tlm((uint8_t)s_state, s_pulse_us);
 }

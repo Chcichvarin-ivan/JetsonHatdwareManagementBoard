@@ -1,6 +1,9 @@
 /**
  * app_status.h — Shared "shadow" status, updated by tasks and snapshotted by
- * the I2C service. Access is short and guarded by FreeRTOS critical sections.
+ * the I2C service. Access is guarded by a PRIMASK-based critical section that
+ * is safe from BOTH task and interrupt context (the I2C event ISR reads and
+ * writes this state). taskENTER_CRITICAL() must never be used here: on this
+ * port it configASSERTs (and hangs) when invoked from an ISR.
  *
  * The flight-envelope corridor configuration also lives here.
  */
@@ -9,6 +12,26 @@
 
 #include <stdint.h>
 #include "proto.h"
+#include "stm32l4xx_hal.h"   /* CMSIS intrinsics: __get_PRIMASK / __get_IPSR */
+#include "FreeRTOS.h"
+#include "task.h"
+
+/* ---- ISR-safe primitives (usable from task, ISR, and pre-scheduler) ----- */
+static inline uint32_t app_crit_enter(void)
+{
+    uint32_t pm = __get_PRIMASK();
+    __disable_irq();
+    return pm;
+}
+static inline void app_crit_exit(uint32_t pm) { __set_PRIMASK(pm); }
+
+/* Millisecond tick that picks the correct FreeRTOS API for the context. */
+static inline uint32_t app_now_ms(void)
+{
+    TickType_t t = (__get_IPSR() != 0u) ? xTaskGetTickCountFromISR()
+                                        : xTaskGetTickCount();
+    return (uint32_t)(t * portTICK_PERIOD_MS);
+}
 
 typedef struct {
     /* status (readable) */

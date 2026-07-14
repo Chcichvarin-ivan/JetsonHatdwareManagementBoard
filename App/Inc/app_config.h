@@ -55,7 +55,7 @@
 #define RGB_R_CLK_ENABLE()            __HAL_RCC_GPIOB_CLK_ENABLE()
 #define RGB_G_CLK_ENABLE()            __HAL_RCC_GPIOB_CLK_ENABLE()
 #define RGB_B_CLK_ENABLE()            __HAL_RCC_GPIOB_CLK_ENABLE()
-#define RGB_ACTIVE_LOW                0   /* 1 if a pin drives its LED when low */
+#define RGB_ACTIVE_LOW                1   /* 1 if a pin drives its LED when low */
 
 /* Button pin (single source of truth; used by the gesture engine in main.c,
  * the debug helper App_ButtonDebug(), and reference). */
@@ -67,14 +67,30 @@
 #define US_PUMP                       1650u
 #define US_ACTUATE                    1825u
 #define US_FAILSAFE                   1500u
-#define PUMP_MIN_HOLD_MS              2000u
-#define ACTUATE_MIN_HOLD_MS           200u
+#define PUMP_MIN_HOLD_MS              2000u   /* MINIMUM hold of 1650 us (spec: >= 2.0 s) */
+/* CCR preload latches at the next timer update (one 20 ms period @ 50 Hz), so
+ * a level change can start up to one period after the timestamp while its
+ * release lands immediately on an update. Without margin the PHYSICAL hold can
+ * fall one period short of the spec minimum in the worst phase alignment. */
+#define PWM_LATCH_MARGIN_MS           20u
+#define PUMP_CONFIRM_TIMEOUT_MS       10000u  /* max wait for telemetry READY while pumping */
+#define ACTUATE_MIN_HOLD_MS           500u
 
 /* Timeouts / windows (ms) */
 #define COMMS_TIMEOUT_MS              300u
 #define HB_FRESH_TIMEOUT_MS           300u
-#define ARM_WINDOW_MS                 3000u
+/* Arming model: the FSM AUTO-ARMS when the pump stage is confirmed by
+ * telemetry (1400 us after the >= 2.0 s hold) and stays ARMED indefinitely.
+ * There is no ARM command step and no arming window. Firing requires a
+ * single ACTUATE whose ARG carries ACTUATE_ARG_KEY (single-frame
+ * confirmation replacing the removed two-step arming; set
+ * ACTUATE_REQUIRE_KEY to 0 to accept any ARG). */
+#define ACTUATE_REQUIRE_KEY           1
+#define ACTUATE_ARG_KEY               0x1825u
 #define TLM_TIMEOUT_MS                250u
+#define TLM_ERROR_CONFIRM_MS          500u    /* ERROR must persist this long to FAULT */
+#define BOOT_TLM_SETTLE_MS            3000u   /* ignore circuit startup states in BOOT */
+#define FAULT_SELF_HEAL_MS            2000u   /* pre-host: error clear this long -> recover */
 
 /* Telemetry decode windows (us) */
 #define TLM_WIN_CONN_LO               775u

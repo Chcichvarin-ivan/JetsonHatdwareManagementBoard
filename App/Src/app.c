@@ -57,6 +57,10 @@ void App_PostButtonEvent(const btn_event_msg_t *ev)
 static void telemetry_task(void *arg)
 {
     (void)arg;
+    /* (Re)arm I2C slave listen from task context: EnableListen called before
+     * osKernelStart can be lost depending on NVIC/HAL state at that moment.
+     * Doing it here guarantees the peripheral is listening once the RTOS runs. */
+    i2c_reg_arm_listen();
     const TickType_t period = pdMS_TO_TICKS(TELEMETRY_PERIOD_MS);
     TickType_t last = xTaskGetTickCount();
     for (;;) {
@@ -76,7 +80,7 @@ static uint8_t test_cmd(uint8_t opcode, uint16_t arg)
 uint8_t App_TestStandby(void)    { return test_cmd(OP_SET_STANDBY, 0); }
 uint8_t App_TestPump(void)       { return test_cmd(OP_PUMP, 0); }
 uint8_t App_TestArm(void)        { return test_cmd(OP_ARM, 0); }
-uint8_t App_TestFire(void)       { return test_cmd(OP_ACTUATE, 0); }
+uint8_t App_TestFire(void)       { return test_cmd(OP_ACTUATE, ACTUATE_ARG_KEY); }
 uint8_t App_TestDisarm(void)     { return test_cmd(OP_DISARM, 0); }
 uint8_t App_TestClearFault(void) { return test_cmd(OP_CLEAR_FAULT, 0); }
 uint8_t App_TestFailsafe(void)   { return test_cmd(OP_FORCE_FAILSAFE, 0); }
@@ -159,9 +163,10 @@ void App_LedTick(void)
     uint8_t  fsm   = snap[REG_FSM_STATE];
     uint16_t fault = (uint16_t)snap[REG_FAULT_FLAGS] | ((uint16_t)snap[REG_FAULT_FLAGS + 1] << 8);
     uint8_t  fresh = envelope_hb_fresh(now);
+    uint8_t  seen  = comms_seen();
     uint8_t  btn_code = snap[REG_BTN_EVENT];
     uint8_t  btn_seq  = snap[REG_BTN_SEQ];
-    rgb_led_update(now, fsm, fault, fresh, btn_code, btn_seq);
+    rgb_led_update(now, fsm, fault, fresh, seen, btn_code, btn_seq);
 }
 
 void App_NoteButtonAlive(void) { health_stamp(HEALTH_BUTTON); }
@@ -180,7 +185,8 @@ void App_ButtonDebug(uint8_t *pressed, uint8_t *last_code, uint8_t *seq)
 
 uint8_t App_WwdgShouldRefresh(void)
 {
-    uint32_t now = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    /* Runs inside the WWDG early-wakeup ISR. */
+    uint32_t now = app_now_ms();
     return health_all_ok(now);
 }
 

@@ -8,8 +8,11 @@
 
 static app_status_t g;
 
-#define ENTER()  taskENTER_CRITICAL()
-#define EXIT()   taskEXIT_CRITICAL()
+/* ISR-safe: these functions run from both tasks and the I2C event ISR.
+ * PRIMASK save/disable/restore is legal in every context; the guarded copies
+ * are a few dozen bytes, so interrupts are masked for well under 1 us. */
+#define ENTER()  uint32_t crit_pm_ = app_crit_enter()
+#define EXIT()   app_crit_exit(crit_pm_)
 
 void status_init(void)
 {

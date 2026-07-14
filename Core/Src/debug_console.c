@@ -16,6 +16,7 @@
 #include "btn_def.h"
 #include "app.h"
 #include "app_config.h"
+#include "i2c_reg.h"
 /* ============================================================================
  * Compile-time tunables
  * ============================================================================
@@ -756,6 +757,17 @@ static void vI2cTask(void *arg)
 
     if (!logged_in || !session_active) continue;
 
+    /* SLAVE-BUS GUARD: this board is an I2C SLAVE (0x40) to the Jetson on
+     * hi2c1. Master-mode HAL calls (scan/rd/wr) on the same handle knock the
+     * peripheral out of listen mode and kill protocol reception. The worker
+     * is kept for script/queue compatibility, but hardware ops are refused. */
+    if (job.op != I2C_OP_DELAY)
+    {
+      DBG_Puts("[i2c] disabled: board is I2C SLAVE 0x40 on this bus.\r\n"
+               "      Use `ext status` / `ext i2c` for protocol diagnostics.\r\n");
+      continue;
+    }
+
     if (job.op == I2C_OP_DELAY)
     {
       osDelay(pdMS_TO_TICKS(job.delay_ms));
@@ -1379,11 +1391,29 @@ static void handle_line(char *line)
   {
     if (n < 2)
     {
-      DBG_Puts("usage: ext status|standby|pump|arm|fire|disarm|clearfault|failsafe\r\n"
+      DBG_Puts("usage: ext status|i2c|standby|pump|arm|fire|disarm|clearfault|failsafe\r\n"
                "       ext hb <alt_dm> <spd_cms> [flags]\r\n"
                "       ext sim on <alt_dm> <spd_cms> [flags] | ext sim off\r\n"
                "       ext cfg <alt_min_dm> <alt_max_dm> <spd_max_cms>\r\n"
                "       (alt in 0.1 m, spd in 0.01 m/s; flags default 0x03=NAV|MISSION)\r\n");
+    }
+    else if (!strcmp(tok[1], "i2c"))
+    {
+      i2c_reg_diag_t d;
+      i2c_reg_get_diag(&d);
+      DBG_Printf("listen=%u addr=%lu rx=%lu tx=%lu stop=%lu err=%lu ok=%lu bad=%lu lastreg=0x%02X\r\n",
+                 d.listening,
+                 (unsigned long)d.addr_hits, (unsigned long)d.rx_bytes,
+                 (unsigned long)d.tx_starts, (unsigned long)d.listen_cplt,
+                 (unsigned long)d.errors,
+                 (unsigned long)d.frames_ok, (unsigned long)d.frames_bad,
+                 d.last_regptr);
+      i2c_pin_report_t pr;
+      i2c_reg_pin_report(&pr);
+      DBG_Printf("pins: PA10 m=%u af=%u lvl=%u | PB6 m=%u af=%u lvl=%u | PB7 m=%u af=%u lvl=%u  (m: 0=IN 1=OUT 2=AF 3=AN; I2C needs m=2 af=4; idle lvl=1)\r\n",
+                 pr.pa10_mode, pr.pa10_af, pr.pa10_lvl,
+                 pr.pb6_mode,  pr.pb6_af,  pr.pb6_lvl,
+                 pr.pb7_mode,  pr.pb7_af,  pr.pb7_lvl);
     }
     else if (!strcmp(tok[1], "status"))
     {
@@ -1396,7 +1426,7 @@ static void handle_line(char *line)
     }
     else if (!strcmp(tok[1], "standby"))    { DBG_Puts(App_TestStandby()    ? "[ext] -> STANDBY\r\n"     : "[ext] queue full\r\n"); }
     else if (!strcmp(tok[1], "pump"))       { DBG_Puts(App_TestPump()       ? "[ext] -> PUMP\r\n"        : "[ext] queue full\r\n"); }
-    else if (!strcmp(tok[1], "arm"))        { DBG_Puts(App_TestArm()        ? "[ext] -> ARM (needs permit + TLM_READY)\r\n" : "[ext] queue full\r\n"); }
+    else if (!strcmp(tok[1], "arm"))        { DBG_Puts(App_TestArm()        ? "[ext] ARM is automatic after PUMP (no-op; ACK only when armed)\r\n" : "[ext] queue full\r\n"); }
     else if (!strcmp(tok[1], "fire"))       { DBG_Puts(App_TestFire()       ? "[ext] -> ACTUATE (only if armed + ACTUATE_ALLOWED)\r\n" : "[ext] queue full\r\n"); }
     else if (!strcmp(tok[1], "disarm"))     { DBG_Puts(App_TestDisarm()     ? "[ext] -> DISARM\r\n"      : "[ext] queue full\r\n"); }
     else if (!strcmp(tok[1], "clearfault")) { DBG_Puts(App_TestClearFault() ? "[ext] -> CLEAR_FAULT\r\n" : "[ext] queue full\r\n"); }

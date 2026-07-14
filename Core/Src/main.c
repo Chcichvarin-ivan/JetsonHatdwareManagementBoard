@@ -368,6 +368,18 @@ static void MX_GPIO_Init(void)
   HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
 
   /* USER CODE BEGIN MX_GPIO_Init_2 */
+  /* Actuation outputs PA0/PA1: drive LOW from the earliest moment so the
+   * circuit never sees FLOATING command lines during MCU boot — at a
+   * simultaneous power-up it can latch its power/control ERROR from garbage
+   * seen during its own startup. MX_TIM2_Init re-muxes these pins to TIM2
+   * PWM immediately after, and standby pulses (1150 us) begin. */
+  HAL_GPIO_WritePin(GPIOA, GPIO_PIN_0|GPIO_PIN_1, GPIO_PIN_RESET);
+  GPIO_InitStruct.Pin = GPIO_PIN_0|GPIO_PIN_1;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
   /* RGB status LEDs (App/rgb_led.c) self-configure their own pins in
    * rgb_led_init(); nothing needed here unless you want them pre-driven. */
   /* USER CODE END MX_GPIO_Init_2 */

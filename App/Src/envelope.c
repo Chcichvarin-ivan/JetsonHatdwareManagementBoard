@@ -26,7 +26,7 @@ void envelope_on_heartbeat(uint8_t hb_seq, uint16_t alt, uint16_t spd, uint8_t h
     s_alt       = alt;
     s_spd       = spd;
     s_hb_flags  = hb_flags;
-    s_last_hb_ms = xTaskGetTickCount() * portTICK_PERIOD_MS;
+    s_last_hb_ms = app_now_ms();   /* ISR-safe: called from I2C ISR and tasks */
     s_have_hb   = 1;
 }
 
@@ -43,9 +43,15 @@ uint8_t envelope_compute(uint32_t now_ms, uint8_t fsm_state, uint8_t tlm_state)
     uint8_t permit = 0;
 
     uint8_t fresh = envelope_hb_fresh(now_ms);
-    if (fresh) permit |= PERMIT_HB_FRESH;
-    else       fault_set(FAULT_HB_STALE);
-    if (fresh) fault_clear(FAULT_HB_STALE);
+    if (fresh) {
+        permit |= PERMIT_HB_FRESH;
+        fault_clear(FAULT_HB_STALE);
+    } else if (s_have_hb) {
+        /* "Stale" means was-fresh-then-aged. Before the FIRST heartbeat ever
+         * (Jetson still booting) nothing is stale — no fault is latched; the
+         * missing PERMIT_HB_FRESH bit alone blocks arming. */
+        fault_set(FAULT_HB_STALE);
+    }
 
     if (s_hb_flags & HB_FLAG_NAV_VALID) permit |= PERMIT_NAV_VALID;
     if (s_hb_flags & HB_FLAG_MISSION)   permit |= PERMIT_MISSION;
@@ -56,7 +62,18 @@ uint8_t envelope_compute(uint32_t now_ms, uint8_t fsm_state, uint8_t tlm_state)
         if (s_spd <= smax)                  permit |= PERMIT_SPD_OK;
     } /* else: corridor not configured -> ALT_OK/SPD_OK stay 0 (blocked) */
 
-    if (tlm_state == TLM_READY)   permit |= PERMIT_TLM_READY;
+    /* Readiness (bit 6): the circuit reports READY (1400 us) only transiently
+     * in answer to the pump command, then rests at IDLE — so a live
+     * "tlm == READY" precondition can never hold at ARM time. The durable
+     * evidence that the pump stage passed is the FSM itself (it can only be
+     * in READY/ARMED/ACTUATING via the verified PUMPING->READY transition).
+     * Live telemetry stays in as a HEALTH gate: dead (UNKNOWN) or ERROR
+     * telemetry still removes readiness and blocks arming/actuation. */
+    uint8_t pump_ok = (fsm_state == FSM_READY ||
+                       fsm_state == FSM_ARMED ||
+                       fsm_state == FSM_ACTUATING);
+    uint8_t tlm_alive = (tlm_state != TLM_UNKNOWN && tlm_state != TLM_ERROR);
+    if (pump_ok && tlm_alive)     permit |= PERMIT_TLM_READY;
     if (fsm_state == FSM_ARMED)   permit |= PERMIT_ARMED;
 
     if ((permit & PERMIT_ARM_MASK) == PERMIT_ARM_MASK && (permit & PERMIT_ARMED)) {
