@@ -114,6 +114,14 @@ typedef enum {
 #define FAULT_CONFIG_MISSING     (1u << 11)
 #define FAULT_PUMP_NOACK         (1u << 12)  /* pump command never confirmed by telemetry */
 
+/* TERMINAL faults: latched until a hardware reset / power cycle. CLEAR_FAULT
+ * does NOT clear them and the pre-host self-heal path skips them. Rationale:
+ * an unconfirmed pump means the actuation circuit did not acknowledge a
+ * pressure command — the cause is physical (wiring, level, circuit fault),
+ * never transient, so silently allowing a retry would mask it. Recovery is a
+ * deliberate power cycle after the cause has been investigated. */
+#define FAULT_TERMINAL_MASK      (FAULT_PUMP_NOACK)
+
 /* --------------------------- Heartbeat flags ------------------------------ */
 #define HB_FLAG_NAV_VALID  (1u << 0)
 #define HB_FLAG_MISSION    (1u << 1)

@@ -32,14 +32,23 @@ static void enter(fsm_state_t st, uint32_t now_ms)
     status_set_fsm((uint8_t)st);
 }
 
+static void to_failsafe(uint32_t now_ms) { pwm_set_failsafe(); enter(FSM_FAILSAFE, now_ms); }
+static void to_fault(uint32_t now_ms)    { pwm_set_failsafe(); enter(FSM_FAULT, now_ms); }
+
+/* STANDBY is the ONLY door back into operation, so the terminal-fault guard
+ * lives here rather than at each call site. With a terminal fault latched every
+ * route to STANDBY — host SET_STANDBY/DISARM, FailSafe recovery, pre-host
+ * self-heal — is redirected to FAULT. Without this guard the latch could be
+ * walked around: FORCE_FAILSAFE from FAULT lands in FAILSAFE, which recovers to
+ * STANDBY on a fresh heartbeat, and the board would accept a new PUMP with the
+ * unacknowledged circuit still unfixed. Only a power cycle / reset clears it. */
 static void to_standby(uint32_t now_ms)
 {
+    if (fault_get() & FAULT_TERMINAL_MASK) { to_fault(now_ms); return; }
     pwm_set_ch1_us(US_STANDBY);
     pwm_set_ch2_us(US_STANDBY);
     enter(FSM_STANDBY, now_ms);
 }
-static void to_failsafe(uint32_t now_ms) { pwm_set_failsafe(); enter(FSM_FAILSAFE, now_ms); }
-static void to_fault(uint32_t now_ms)    { pwm_set_failsafe(); enter(FSM_FAULT, now_ms); }
 
 static uint8_t fault_source_active(uint8_t tlm_state)
 {
@@ -89,8 +98,12 @@ static void handle_command(const app_command_t *cmd, uint32_t now_ms,
         if (s_state != FSM_FAULT) to_standby(now_ms);   /* ARMED incl.: back to standby */
         break;
     case OP_CLEAR_FAULT:
-        if (!fault_source_active(tlm_state)) {
-            fault_clear(0xFFFFu & ~FAULT_CONFIG_MISSING);
+        /* Terminal faults are never cleared by command (see FAULT_TERMINAL_MASK). */
+        if (fault_get() & FAULT_TERMINAL_MASK) {
+            result = RES_NACK;
+        } else if (!fault_source_active(tlm_state)) {
+            fault_clear((uint16_t)(0xFFFFu & ~FAULT_CONFIG_MISSING
+                                          & ~FAULT_TERMINAL_MASK));
             if (s_state == FSM_FAULT) to_standby(now_ms);
         } else result = RES_NACK;
         break;
@@ -230,11 +243,22 @@ void actuation_task(void *arg)
              * no longer present). A confirmation timeout returns to standby
              * with FAULT_PUMP_NOACK so the failure is visible, not silent. */
             uint32_t held = now - s_enter_ms;
+#if APP_ASSEMBLY_TEST
+            /* Цепь может быть не подключена: взводим по таймеру, а не по 1400 мкс.
+             * Если реальная цепь ЕСТЬ и подтверждает раньше — используем это. */
+            uint8_t confirmed = (tlm == TLM_READY) || (held >= ASSEMBLY_PUMP_MS);
+            if (confirmed && held >= (PUMP_MIN_HOLD_MS + PWM_LATCH_MARGIN_MS)) {
+#else
             if (tlm == TLM_READY && held >= (PUMP_MIN_HOLD_MS + PWM_LATCH_MARGIN_MS)) {
+#endif
+                pwm_set_ch1_us(US_STANDBY);
                 enter(FSM_ARMED, now);   /* AUTO-ARM on hardware confirmation */
             } else if (held >= PUMP_CONFIRM_TIMEOUT_MS) {
+                /* TERMINAL: the circuit never acknowledged the pump command.
+                 * Latch and stay in FAULT — safe levels, no CLEAR_FAULT, no
+                 * self-heal. Only a power cycle / reset resumes operation. */
                 fault_set(FAULT_PUMP_NOACK);
-                to_standby(now);
+                to_fault(now);
             }
             break;
         }
@@ -267,10 +291,12 @@ void actuation_task(void *arg)
              * cleared and stayed clear, recover to STANDBY autonomously.
              * After first host contact, recovery is host-owned as designed. */
             if (!comms_seen() && !s_tlm_err_active &&
+                !(fault_get() & FAULT_TERMINAL_MASK) &&
                 tlm != TLM_ERROR && tlm != TLM_UNKNOWN) {
                 if (s_fault_clear_since == 0u) s_fault_clear_since = now;
                 if ((now - s_fault_clear_since) >= FAULT_SELF_HEAL_MS) {
-                    fault_clear(0xFFFFu & ~FAULT_CONFIG_MISSING);
+                    fault_clear((uint16_t)(0xFFFFu & ~FAULT_CONFIG_MISSING
+                                                  & ~FAULT_TERMINAL_MASK));
                     s_fault_clear_since = 0u;
                     to_standby(now);
                 }
