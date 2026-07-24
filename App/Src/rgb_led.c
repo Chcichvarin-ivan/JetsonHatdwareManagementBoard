@@ -53,6 +53,26 @@ static color_t resolve(uint8_t fsm, uint16_t fault, uint8_t hb_fresh,
                        uint8_t link_seen, pattern_t *pat)
 {
     if (fsm == FSM_FAULT)                                    { *pat = PAT_FAST;  return C_RED;   }
+#if APP_ASSEMBLY_TEST
+    /* Сборочный стол: реального I2C нет, link_seen всегда 0 — из-за чего ниже
+     * срабатывал бы «нет линии -> синий» и МАСКИРОВАЛ реальные состояния
+     * (накачка/взведено/активация). Считаем связь «видимой», чтобы индикация
+     * отражала фактическое состояние цепи:
+     *   ДЕЖУРНЫЙ — зелёный ровно; НАКАЧКА — синий медл.; ВЗВЕДЕНО — зелёный
+     *   част.; АКТИВАЦИЯ — красный ровно (~220 мс); ФС — красный медл. */
+    link_seen = 1u;
+#endif
+#if APP_BTN_CTRL
+    /* Стендовый кнопочный режим: до первого кадра хоста НЕ показываем «жду
+     * хост» (иначе оператор жмёт кнопку, а индикация говорит обратное). В
+     * рабочих состояниях (накачка/взведено/активация/ФС) отдаём приоритет
+     * штатной индикации ниже; в покое до контакта — предупреждающий сигнал
+     * «локальное управление активно»: красный медленный + периодический
+     * зелёный уже даёт blip нажатия. Здесь: жёлтая имитация недоступна (чистые
+     * цвета), поэтому используем зелёный МЕДЛЕННЫЙ как «стенд, готов». */
+    if (!link_seen && (fsm == FSM_BOOT || fsm == FSM_STANDBY))
+                                                             { *pat = PAT_SLOW;  return C_GREEN; }
+#endif
     if (!link_seen)                                          { *pat = PAT_SOLID; return C_BLUE;  }
     if (!hb_fresh || (fault & (FAULT_COMMS_TIMEOUT | FAULT_HB_STALE)))
                                                              { *pat = PAT_FAST;  return C_BLUE;  }
@@ -79,7 +99,34 @@ void rgb_led_update(uint32_t now_ms, uint8_t fsm_state, uint16_t fault_flags,
                     uint8_t hb_fresh, uint8_t link_seen,
                     uint8_t btn_code, uint8_t btn_seq)
 {
-#if APP_BTN_MODE
+#if APP_ASSEMBLY_TEST
+    /* --- Диагностика распайки/полярности: первые 3 с после включения
+     * циклически R(0-1с) -> G(1-2с) -> B(2-3с) ровным светом. Сверьте с
+     * платой: если «красный» физически горит на зелёном выводе или все три
+     * сразу — полярность инвертирована (нужен RGB_ACTIVE_LOW=1). */
+    if (now_ms < 3000u) {
+        color_t seq = (now_ms < 1000u) ? C_RED : (now_ms < 2000u) ? C_GREEN : C_BLUE;
+        drive(seq, 1);
+        return;
+    }
+    /* --- Код причины останова: в FAULT синий мигает N раз (N = младший
+     * установленный бит фолта + 1), пауза, повтор. Позволяет прочитать
+     * фолт без I2C и консоли:
+     *   1 вспышка = COMMS_TIMEOUT(0)   2 = TLM_TIMEOUT(1)   3 = POWER_ERROR(2)
+     *   4 = CRC(3)  5 = SEQ_GAP(4)  8 = ENVELOPE(8)  10 = HB_STALE(9)
+     *   12 = CONFIG_MISSING(11)  13 = PUMP_NOACK(12, терминальный). */
+    if (fsm_state == FSM_FAULT && fault_flags) {
+        uint8_t bit = 0;
+        while (bit < 15 && !(fault_flags & (1u << bit))) bit++;
+        uint8_t n = (uint8_t)(bit + 1u);
+        uint32_t cycle = now_ms % ((uint32_t)n * 300u + 900u);  /* вспышки + пауза 900мс */
+        uint8_t idx = (uint8_t)(cycle / 300u);
+        uint8_t on = (idx < n) && ((cycle % 300u) < 150u);
+        drive(C_BLUE, on);
+        return;
+    }
+#endif
+#if APP_BTN_MODE || APP_BTN_CTRL
     /* Show a short colour blip whenever a new button gesture is reported, so a
      * press is visible on the bench without a Jetson:
      *   single = green, double = blue, long = red (all fast blink). */

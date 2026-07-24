@@ -89,6 +89,7 @@ static void handle_command(const app_command_t *cmd, uint32_t now_ms,
             && cmd->arg == ACTUATE_ARG_KEY
 #endif
            ) {
+            pwm_set_ch1_us(US_PUMP);
             pwm_set_ch2_us(US_ACTUATE);
             sensor_as_clear();
             enter(FSM_ACTUATING, now_ms);
@@ -119,11 +120,46 @@ static void handle_command(const app_command_t *cmd, uint32_t now_ms,
 
 /* Map a raw button gesture to a SAFE local action + reflect it in BTN_EVENT.
  * The button can NEVER pump, arm or actuate. */
-static void handle_button(btn_evt_type_t type, uint32_t now_ms, uint8_t tlm_state)
+static void handle_command(const app_command_t *cmd, uint32_t now_ms,
+                           uint8_t permit, uint8_t tlm_state);
+
+static void handle_button(btn_evt_type_t type, uint32_t now_ms,
+                          uint8_t tlm_state, uint8_t permit)
 {
-#if APP_BTN_MODE
+#if APP_BTN_CTRL
+    /* СТЕНД: одиночное = НАКАЧКА, двойное = АКТИВАЦИЯ. Через ту же handle_command,
+     * поэтому ВСЕ блокировки FSM сохраняются (кнопка не привилегирована).
+     * Синтетическая команда: seq наследует последовательность, чтобы не
+     * взводить FAULT_SEQ_GAP; ключ активации подставляется при необходимости. */
+    app_command_t bc;
+    bc.seq = (uint8_t)(s_last_seq + 1u);
+    bc.arg = 0;
+    switch (type) {
+    case BTN_EVT_PRESSED:
+        status_set_button(BTN_CODE_PRESSED);
+        bc.opcode = OP_PUMP;
+        handle_command(&bc, now_ms, permit, tlm_state);
+        break;
+    case BTN_EVT_DOUBLE_PRESS:
+        status_set_button(BTN_CODE_DOUBLE);
+        bc.opcode = OP_ACTUATE;
+#if ACTUATE_REQUIRE_KEY
+        bc.arg = ACTUATE_ARG_KEY;     /* стендовая кнопка знает ключ */
+#endif
+        handle_command(&bc, now_ms, permit, tlm_state);
+        break;
+    case BTN_EVT_LONG_PRESS:
+        /* Длинное — аварийный сброс в ФС (безопасное действие, оставляем). */
+        status_set_button(BTN_CODE_LONG);
+        to_failsafe(now_ms);
+        break;
+    default: break;
+    }
+    (void)tlm_state; (void)permit;
+    return;
+#elif APP_BTN_MODE
     /* Report-only: post the gesture; no local control actions. */
-    (void)now_ms; (void)tlm_state;
+    (void)now_ms; (void)tlm_state; (void)permit;
     switch (type) {
     case BTN_EVT_PRESSED:      status_set_button(BTN_CODE_PRESSED); break;
     case BTN_EVT_DOUBLE_PRESS: status_set_button(BTN_CODE_DOUBLE);  break;
@@ -131,6 +167,7 @@ static void handle_button(btn_evt_type_t type, uint32_t now_ms, uint8_t tlm_stat
     default: break;
     }
 #else
+    (void)permit;
     switch (type) {
     case BTN_EVT_PRESSED:      /* acknowledge only */
         status_set_button(BTN_CODE_PRESSED);
@@ -161,6 +198,8 @@ void actuation_init(QueueHandle_t cmd_queue)
     s_last_seq = 0;
 }
 
+static uint32_t s_boot0_ms;   /* метка включения питания для грации TLM ERROR */
+
 void actuation_task(void *arg)
 {
     (void)arg;
@@ -168,6 +207,7 @@ void actuation_task(void *arg)
     pwm_set_ch1_us(US_STANDBY);
     pwm_set_ch2_us(US_STANDBY);
     enter(FSM_BOOT, now);
+    s_boot0_ms = now;
 
     const TickType_t period = pdMS_TO_TICKS(ACTUATION_PERIOD_MS);
     TickType_t last_wake = xTaskGetTickCount();
@@ -178,9 +218,35 @@ void actuation_task(void *arg)
 
         if (s_btn_q == NULL) s_btn_q = App_FsmButtonQueue();  /* dedicated FSM queue */
 
+#if APP_ASSEMBLY_TEST
+        /* Сборочный режим: I2C-хоста нет. Каждый тик подаём внутренний «свежий»
+         * конверт и один раз — коридор, чтобы кнопка провела полный цикл.
+         * envelope_on_heartbeat обновляет метку времени, поэтому HB всегда свеж
+         * и сторожевой таймер связи не срабатывает. */
+        envelope_on_heartbeat((uint8_t)(now / 100u),
+                              ASSEMBLY_ALT_DM, ASSEMBLY_SPD_CMS,
+                              (uint8_t)(HB_FLAG_NAV_VALID | HB_FLAG_MISSION));
+        {
+            uint16_t a0, a1, s0;
+            if (!status_get_config(&a0, &a1, &s0)) {
+                status_set_config(ASSEMBLY_ALT_MIN_DM, ASSEMBLY_ALT_MAX_DM,
+                                  ASSEMBLY_SPD_MAX_CMS);
+            }
+        }
+#endif
+
         uint8_t tlm    = (uint8_t)telemetry_get_state();
+        /* Телеметрия НЕ маскируется даже в сборочном режиме: имитатор/цепь на
+         * Кан.4 (PA3) — объект проверки (IDLE -> PUMP_RX -> READY; ERROR с
+         * восстановлением). Единственная поблажка сборочного режима живёт в
+         * telemetry_tick(): МОЛЧАЩАЯ линия (имитатор выключен/не подключён)
+         * деградирует в IDLE без отказа, вместо TLM_TIMEOUT. */
         uint8_t permit = envelope_compute(now, (uint8_t)s_state, tlm);
+#if APP_ASSEMBLY_TEST
+        uint8_t link_ok = 1u;          /* нет шины — но связь считаем живой */
+#else
         uint8_t link_ok = comms_ok(now);
+#endif
 
         if (!link_ok) fault_set(FAULT_COMMS_TIMEOUT);
         else          fault_clear(FAULT_COMMS_TIMEOUT);
@@ -196,8 +262,22 @@ void actuation_task(void *arg)
         uint8_t tlm_err_confirmed = 0;
         if (tlm == TLM_ERROR) {
             if (!s_tlm_err_active) { s_tlm_err_active = 1; s_tlm_err_since = now; }
-            uint8_t settled = (s_state != FSM_BOOT) ||
-                              ((now - s_enter_ms) > BOOT_TLM_SETTLE_MS);
+            /* Грация меряется от ВКЛЮЧЕНИЯ ПИТАНИЯ, а не от пребывания в
+             * BOOT: в сборочном режиме (и при автономном старте) BOOT выходит
+             * в ДЕЖУРНЫЙ за ~250 мс, и стартовый ERROR самой цепи/имитатора
+             * прилетал уже ПОСЛЕ окончания грации -> ложный FAULT на старте
+             * с самовосстановлением через 2 с. Задержка защёлки безопасна:
+             * пока ERROR активен, permit-цепочка (tlm_alive) всё равно
+             * блокирует взведение и активацию. */
+            uint8_t settled = ((now - s_boot0_ms) > BOOT_TLM_SETTLE_MS) ? 1u : 0u;
+#if APP_ASSEMBLY_TEST
+            /* Стенд: имитатор может грузиться дольше любой фиксированной
+             * грации. Пока с включения не пришло НИ ОДНОГО валидного импульса
+             * телеметрии (реальные IDLE/PUMP_RX/READY), «ERROR с рождения»
+             * считаем его собственной загрузкой и защёлку не ставим. После
+             * первого валидного импульса действует обычный дебаунс 500 мс. */
+            if (!telemetry_valid_pulse_seen()) settled = 0u;
+#endif
             tlm_err_confirmed = (settled &&
                 (now - s_tlm_err_since) >= TLM_ERROR_CONFIRM_MS) ? 1u : 0u;
         } else {
@@ -224,7 +304,7 @@ void actuation_task(void *arg)
         if (s_btn_q != NULL) {
             btn_event_msg_t ev;
             if (xQueueReceive(s_btn_q, &ev, 0) == pdPASS) {
-                handle_button(ev.type, now, tlm);
+                handle_button(ev.type, now, tlm, permit);
             }
         }
 
@@ -273,14 +353,24 @@ void actuation_task(void *arg)
         case FSM_ACTUATING:
             /* +PWM_LATCH_MARGIN_MS guarantees the PHYSICAL 1825 us level meets
              * the >= 200 ms spec despite CCR-preload phase alignment. */
+#if APP_ASSEMBLY_TEST
+            if ((now - s_enter_ms) >= (ASSEMBLY_ACTUATE_HOLD_MS + PWM_LATCH_MARGIN_MS)) {
+#else
             if ((now - s_enter_ms) >= (ACTUATE_MIN_HOLD_MS + PWM_LATCH_MARGIN_MS)) {  /* never cut short */
+#endif
                 if (sensor_as_triggered()) status_set_sensor(1);
+#if APP_ASSEMBLY_TEST
+  //              to_standby(now);   /* нет линии: после удержания — возврат в ДЕЖУРНЫЙ */
+#else
                 if (!link_ok) to_failsafe(now);
                 else          to_standby(now);
+#endif
             }
             break;
         case FSM_FAILSAFE:
             status_set_arm_time_left(0);
+            /* Recovery is attempted via to_standby(), which redirects to FAULT
+             * while a terminal fault is latched (see to_standby). */
             if (link_ok && envelope_hb_fresh(now)) to_standby(now);
             break;
         case FSM_FAULT:

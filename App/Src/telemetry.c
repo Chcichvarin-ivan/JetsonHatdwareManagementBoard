@@ -88,6 +88,7 @@ void telemetry_tick(uint32_t now_ms)
     } else {
         fault_clear(FAULT_TLM_TIMEOUT);
     }
+#endif
     /* FAULT_POWER_ERROR is latched by the supervisor only after the ERROR
      * state is CONFIRMED (debounced) — see actuation.c. A single reading
      * during the circuit's own power-up must not latch a fault. */

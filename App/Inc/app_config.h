@@ -119,7 +119,54 @@
  *       clear-fault. This matches the original report-only button board.
  *   0 = the button also performs safe local actions (long=failsafe,
  *       double=clear-fault). It still can never pump/arm/actuate. */
-#define APP_BTN_MODE                  1
+#define APP_BTN_MODE                  0
+
+/* APP_BTN_CTRL — СТЕНДОВОЕ управление боевой цепью с кнопки (НЕ для полёта!).
+ *   0 = штатно: кнопка НЕ управляет накачкой/активацией (APP_BTN_MODE решает,
+ *       докладывать жест или выполнять безопасные локальные действия);
+ *   1 = отладка на стенде: одиночное нажатие = НАКАЧКА, двойное = АКТИВАЦИЯ.
+ *       Активация по-прежнему проходит ВСЕ блокировки FSM (конверт, ARM и т.д.)
+ *       — кнопка лишь подаёт те же команды, что хост. Одиночным/двойным
+ *       нажатием нельзя обойти проверки; при снаряжённой БЧ флаг обязан быть 0.
+ * Требует APP_BTN_MODE=0 (иначе кнопка компилируется в режиме «только доклад»).
+ * Флаг перекрывает поведение handle_button ниже. */
+#ifndef APP_BTN_CTRL
+#define APP_BTN_CTRL                  1
+#endif
+#if APP_BTN_CTRL && APP_BTN_MODE
+#error "APP_BTN_CTRL=1 requires APP_BTN_MODE=0 (report-only mode blocks local control)"
+#endif
+
+/* APP_ASSEMBLY_TEST — СБОРОЧНЫЙ тест платы БЕЗ I2C и (возможно) БЕЗ цепи.
+ *   0 = штатно;
+ *   1 = автономный стенд ОТК: I2C-хост не нужен. Плата сама формирует «свежий»
+ *       конверт (heartbeat/NAV/MISSION/коридор), поэтому кнопка проводит полный
+ *       цикл: 1 нажатие -> накачка, 2 нажатия -> активация, RGB сигнализирует.
+ *   Что снимается ТОЛЬКО в этом режиме:
+ *     - сторожевой таймер связи (нет I2C -> нет ложного ФС);
+ *     - требование телеметрии READY для взведения: если цепь не подключена,
+ *       накачка завершается по таймеру ASSEMBLY_PUMP_MS (а не по 1400 мкс);
+ *     - источник конверта — внутренний, значения ниже.
+ *   Требует APP_BTN_CTRL=1 (цикл ведётся кнопкой).
+ *   ВНИМАНИЕ: сборочный режим намеренно обходит проверки безопасности —
+ *   допустим ТОЛЬКО на столе ОТК с неснаряжённой БЧ; в полёте флаг обязан быть 0. */
+#ifndef APP_ASSEMBLY_TEST
+#define APP_ASSEMBLY_TEST             1
+#endif
+#if APP_ASSEMBLY_TEST && !APP_BTN_CTRL
+#error "APP_ASSEMBLY_TEST=1 requires APP_BTN_CTRL=1 (button drives the cycle)"
+#endif
+/* Внутренний конверт и длительность накачки без цепи (сборочный режим). */
+#define ASSEMBLY_ALT_DM               350u   /* 35.0 м — внутри коридора */
+#define ASSEMBLY_SPD_CMS              120u   /* 1.20 м/с */
+#define ASSEMBLY_ALT_MIN_DM           100u
+#define ASSEMBLY_ALT_MAX_DM           500u
+#define ASSEMBLY_SPD_MAX_CMS          300u
+#define ASSEMBLY_PUMP_MS              2200u  /* накачка завершается по таймеру */
+#define ASSEMBLY_ACTUATE_HOLD_MS      1000u  /* активация: 1825 мкс держится 1 с,
+                                              * чтобы импульс был виден любым
+                                              * прибором и медленным имитатором
+                                              * (в полёте — ACTUATE_MIN_HOLD_MS) */
 
 /* Enable the debug-console actuation bench-test commands (ext ...) and the
  * heartbeat simulator. Set to 0 for a flight build to compile them out so the
