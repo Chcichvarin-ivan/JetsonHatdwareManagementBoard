@@ -18,6 +18,7 @@ void        telemetry_on_capture(TIM_HandleTypeDef *htim);
 /* Latest decoded state + measured pulse; updates TLM_TIMEOUT fault on timeout */
 tlm_state_t telemetry_get_state(void);
 uint16_t    telemetry_get_pulse_us(void);
+uint8_t     telemetry_valid_pulse_seen(void);
 /* Periodic check (called by telemetryTask) — flags timeout if stale */
 void        telemetry_tick(uint32_t now_ms);
 

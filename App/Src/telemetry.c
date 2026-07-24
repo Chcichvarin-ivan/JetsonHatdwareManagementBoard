@@ -14,6 +14,8 @@ static volatile uint16_t  s_pulse_us;
 static volatile uint32_t  s_last_capture_ms;
 static volatile tlm_state_t s_state;
 
+static volatile uint8_t s_valid_seen;   /* был ли РЕАЛЬНЫЙ валидный импульс с линии */
+
 static tlm_state_t classify(uint16_t us)
 {
     if (us >= TLM_WIN_CONN_LO   && us <= TLM_WIN_CONN_HI)   return TLM_CONN_VERIFY;
@@ -53,6 +55,10 @@ void telemetry_on_capture(TIM_HandleTypeDef *htim)
             s_pulse_us = (uint16_t)width;
             s_state = classify(s_pulse_us);
             s_last_capture_ms = xTaskGetTickCountFromISR() * portTICK_PERIOD_MS;
+            if (s_state == TLM_IDLE || s_state == TLM_PUMP_RX ||
+                s_state == TLM_READY || s_state == TLM_CONN_VERIFY) {
+                s_valid_seen = 1u;
+            }
         }
         s_have_rise = 0;
         __HAL_TIM_SET_CAPTUREPOLARITY(htim, TLM_IC_TIM_CHANNEL, TIM_INPUTCHANNELPOLARITY_RISING);
@@ -61,9 +67,20 @@ void telemetry_on_capture(TIM_HandleTypeDef *htim)
 
 tlm_state_t telemetry_get_state(void)    { return s_state; }
 uint16_t    telemetry_get_pulse_us(void) { return s_pulse_us; }
+uint8_t     telemetry_valid_pulse_seen(void) { return s_valid_seen; }
 
 void telemetry_tick(uint32_t now_ms)
 {
+#if APP_ASSEMBLY_TEST
+    /* Сборочный стол: исполнительной цепи может не быть, телеметрия молчит.
+     * Не поднимаем FAULT_TLM_TIMEOUT по отсутствию импульсов. Если реальные
+     * импульсы приходят — s_state отражает их (classify в ISR), иначе держим
+     * IDLE, чтобы health-gate не блокировал взведение. */
+    if ((now_ms - s_last_capture_ms) > TLM_TIMEOUT_MS) {
+        s_state = TLM_IDLE;          /* «живо», не UNKNOWN и не ERROR */
+    }
+    fault_clear(FAULT_TLM_TIMEOUT);
+#else
     uint32_t last = s_last_capture_ms;
     if ((now_ms - last) > TLM_TIMEOUT_MS) {
         s_state = TLM_UNKNOWN;
