@@ -74,7 +74,7 @@
  * fall one period short of the spec minimum in the worst phase alignment. */
 #define PWM_LATCH_MARGIN_MS           20u
 #define PUMP_CONFIRM_TIMEOUT_MS       10000u  /* max wait for telemetry READY while pumping */
-#define ACTUATE_MIN_HOLD_MS           500u
+#define ACTUATE_MIN_HOLD_MS           200u
 
 /* Timeouts / windows (ms) */
 #define COMMS_TIMEOUT_MS              300u
